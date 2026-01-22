@@ -1221,6 +1221,7 @@ def smoke_test(t3, full_len=24, talk_len=4, batch=2):
 
 if __name__ == "__main__":
     import json
+    
     with open("model/config.json", "r") as f:
         cfg = json.load(f)
     t3 = T3Model(cfg, use_lora=True)
