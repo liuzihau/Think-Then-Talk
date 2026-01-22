@@ -1,0 +1,7 @@
+*logs*
+*lora*
+*decoder*
+*hf*
+*wandb*
+*.txt
+*.pyc
