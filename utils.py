@@ -1,6 +1,7 @@
-import os
+import os, json
 import torch
-
+import torch.nn.functional as F
+from typing import Optional, Tuple
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
@@ -26,7 +27,7 @@ def _has_lora_params(module: torch.nn.Module) -> bool:
     return False
 
 
-def save_ckpt(save_root, epoch, model, optimizer, scheduler, extra=None):
+def save_ckpt(save_root, epoch, model, optimizer, scheduler, extra=None,model_config=None):
     """
     Save:
       - talk_model full state_dict
@@ -55,6 +56,11 @@ def save_ckpt(save_root, epoch, model, optimizer, scheduler, extra=None):
         payload.update(extra)
 
     torch.save(payload, ckpt_path)
+    if model_config is not None:
+        json_path =os.path.join(state_dir, "config.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(model_config, f, ensure_ascii=False, indent=2)
+    
     print(f"[CKPT] saved: {ckpt_path}  "
           f"(talk={len(payload['talk_model'])} keys, "
           f"think_lora={len(payload.get('think_lora', {}))} keys)")
@@ -95,6 +101,78 @@ def load_ckpt(state_dir, model, optimizer=None, scheduler=None, map_location="cp
     print(f"[CKPT] loaded: {ckpt_path}  -> start_epoch={start_epoch}")
     return start_epoch
 
+@torch.no_grad()
+def apply_repetition_penalty_3d(
+    logits: torch.Tensor,          # [BG, L, V]
+    context_ids: torch.Tensor,     # [BG, L]  (tokens already in the block)
+    revealed_mask: torch.Tensor,   # [BG, L]  bool, True where token is "seen"/revealed
+    penalty: float = 1.2,
+):
+    """
+    HF-style repetition penalty, applied to logits for tokens that already appeared
+    in the revealed part of context_ids (per row).
+    """
+    if penalty is None or penalty <= 1.0:
+        return logits
+
+    BG, L, V = logits.shape
+    out = logits.clone()
+
+    for b in range(BG):
+        seen = context_ids[b][revealed_mask[b]].tolist()
+        if not seen:
+            continue
+        seen = list(set(seen))  # unique
+
+        # out[b, :, seen] is [L, |seen|]
+        sel = out[b, :, seen]
+
+        # HF rule: if logit > 0 -> divide; else multiply
+        pos = sel > 0
+        sel = torch.where(pos, sel / penalty, sel * penalty)
+        out[b, :, seen] = sel
+
+    return out
+
+
+@torch.no_grad()
+def top_p_sample_from_logits_3d(
+    logits: torch.Tensor,          # [BG, L, V]
+    top_p: float = 0.9,
+    temperature: float = 1.0,
+):
+    """
+    Nucleus sampling per position. Returns sampled token ids: [BG, L]
+    """
+    if temperature is None or temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    logits = logits / temperature
+
+    if top_p is None or top_p >= 1.0:
+        # plain categorical sampling
+        probs = F.softmax(logits, dim=-1)
+        ids = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(logits.size(0), logits.size(1))
+        return ids
+
+    # sort
+    sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+    sorted_probs = F.softmax(sorted_logits, dim=-1)
+    cum_probs = sorted_probs.cumsum(dim=-1)
+
+    # mask tokens with cum prob > top_p (keep at least 1)
+    remove = cum_probs > top_p
+    remove[..., 0] = False
+
+    sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+
+    # sample from filtered distribution
+    probs = F.softmax(sorted_logits, dim=-1)
+    sample_in_sorted = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(logits.size(0), logits.size(1))
+
+    # map back to original vocab ids
+    sampled_ids = sorted_idx.gather(-1, sample_in_sorted.unsqueeze(-1)).squeeze(-1)
+    return sampled_ids
+
 def topk_soft_embedding_from_logits(
     logits: torch.Tensor,          # [BG, L, V]
     emb_weight: torch.Tensor,      # [V, D]
@@ -117,3 +195,149 @@ def topk_soft_embedding_from_logits(
     # weighted sum over K
     soft_emb = (probs.unsqueeze(-1) * emb_k).sum(dim=-2)  # [BG, L, D]
     return soft_emb
+
+
+
+@torch.no_grad()
+def select_reveal_positions(
+    loss_mask: torch.Tensor,          # [BG, L] 1=masked(active), 0=already revealed
+    logits: Optional[torch.Tensor],    # [BG, L, V] (required for greedy)
+    k_reveal: int = 1,
+    mode: str = "random",             # "random" | "greedy" | "ar_force"
+    generator=None,
+) -> torch.Tensor:
+    """
+    Returns:
+      idx: [BG, k] indices to reveal for each row (may include inactive positions if row has <k active)
+    """
+    device = loss_mask.device
+    BG, L = loss_mask.shape
+    active = loss_mask.bool()
+
+    k = min(k_reveal, L)
+    if k <= 0:
+        return torch.empty((BG, 0), dtype=torch.long, device=device)
+
+    if mode == "random":
+        if generator is not None:
+            scores = torch.rand((BG, L), device=device, generator=generator)
+        else:
+            scores = torch.rand((BG, L), device=device)
+        scores = scores.masked_fill(~active, float("-inf"))
+        idx = scores.topk(k=k, dim=1).indices  # [BG, k]
+        return idx
+
+    if mode == "greedy":
+        if logits is None:
+            raise ValueError("mode='greedy' requires logits.")
+        # confidence = max prob (or max logit) at each position
+        # using max logit is fine because monotonic with softmax
+        conf = logits.max(dim=-1).values  # [BG, L]
+        conf = conf.masked_fill(~active, float("-inf"))
+        idx = conf.topk(k=k, dim=1).indices
+        return idx
+
+    if mode == "ar_force":
+        # reveal left-to-right masked positions (like AR order inside the block)
+        # score = -position_index for active, so topk picks smallest indices
+        pos = torch.arange(L, device=device).unsqueeze(0).expand(BG, L)  # [BG, L]
+        scores = (-pos).to(torch.float32)
+        scores = scores.masked_fill(~active, float("-inf"))
+        idx = scores.topk(k=k, dim=1).indices
+        return idx
+
+    raise ValueError(f"Unknown mode: {mode}")
+
+
+# ---------------------------------------------------------
+# 2) denoise step with soft embedding + (optional) inference
+# ---------------------------------------------------------
+def denoise_k_step_soft_embed_v2(
+    input_ids: torch.Tensor,                 
+    target: Optional[torch.Tensor],          
+    loss_mask: torch.Tensor,                 
+    logits: torch.Tensor,                    
+    emb_weight: torch.Tensor,                
+    k_reveal: int = 1,
+    soft_topk: int = 32,
+    soft_temp: float = 1.0,                # used for soft-emb + sampling
+    mode: str = "random",                    
+    generator=None,
+    return_pred_ids: bool = False,
+    top_p: float = 0.9,                      # only used when target is None
+    repetition_penalty: float = 1.0,         # only used when target is None
+    temperature: float = 1.0,
+    sample_tokens: bool = False,              # if False => argmax
+):
+    device = input_ids.device
+    BG, L = input_ids.shape
+
+    # adj logits
+    logits_adj = None
+    if repetition_penalty > 1:
+        revealed_mask = ~loss_mask.bool()  # tokens already "seen" in the block
+        logits_adj = apply_repetition_penalty_3d(
+            logits=logits,
+            context_ids=input_ids,
+            revealed_mask=revealed_mask,
+            penalty=repetition_penalty,
+        )
+
+    # --- pick positions to reveal ---
+    idx = select_reveal_positions(
+        loss_mask=loss_mask,
+        logits=logits_adj if logits_adj is not None else logits,
+        k_reveal=k_reveal,
+        mode=mode,
+        generator=generator,
+    )  # [BG, k]
+
+    active = loss_mask.bool()
+    chosen_active = active.gather(1, idx)  # [BG, k]
+    rows = torch.arange(BG, device=device).unsqueeze(1).expand_as(idx)
+    rows = rows[chosen_active]
+    cols = idx[chosen_active]
+
+    input_ids_next = input_ids.clone()
+    loss_mask_next = loss_mask.clone()
+
+    # --- choose tokens for revealed positions ---
+    if target is None:
+        if sample_tokens:
+            pred_ids = top_p_sample_from_logits_3d(
+                logits=logits_adj if logits_adj is not None else logits,
+                top_p=top_p,
+                temperature=temperature,
+            )  # [BG, L]
+        else:
+            pred_ids = logits_adj.argmax(dim=-1) if logits_adj is not None else logits.argmax(dim=-1)
+
+        input_ids_next[rows, cols] = pred_ids[rows, cols]
+    else:
+        # training teacher forcing
+        pred_ids = logits.argmax(dim=-1)  # for logging only
+        input_ids_next[rows, cols] = target[rows, cols]
+
+    loss_mask_next[rows, cols] = 0
+
+    # --- build embeddings for next step ---
+    base_emb = F.embedding(input_ids_next, emb_weight).to(dtype=emb_weight.dtype)
+
+    # (Optional but recommended) use penalised logits for soft emb too in inference
+    logits_for_soft = logits
+    if target is None and sample_tokens and logits_adj is not None:
+        logits_for_soft = logits_adj
+
+    soft_emb = topk_soft_embedding_from_logits(
+        logits=logits_for_soft,
+        emb_weight=emb_weight,
+        topk=soft_topk,
+        temperature=soft_temp,
+    ).to(dtype=emb_weight.dtype)
+
+    m = loss_mask_next.bool().unsqueeze(-1)
+    input_emb_next = torch.where(m, soft_emb, base_emb)
+
+    if return_pred_ids:
+        return input_ids_next, input_emb_next, loss_mask_next, pred_ids
+    return input_ids_next, input_emb_next, loss_mask_next

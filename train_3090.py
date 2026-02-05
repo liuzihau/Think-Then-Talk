@@ -24,7 +24,7 @@ from tqdm import tqdm
 from model.modeling_t3 import T3Model
 from train.data_process import build_dataset_rank, DataCollatorWithPadding, DataCollatorWithPaddingV2
 from train.visualize import visualize_t3_batch_trace
-from utils import AttrDict, load_ckpt, save_ckpt, topk_soft_embedding_from_logits
+from utils import AttrDict, load_ckpt, save_ckpt, topk_soft_embedding_from_logits, denoise_k_step_soft_embed_v2
 
 
 # -----------------------------
@@ -77,6 +77,84 @@ def ploss_sum_and_count(out_logp, target, loss_mask):
     m = loss_mask.float()
     loss_sum = -(target_logp * m).sum()
     count = m.sum()
+    return loss_sum, count
+
+def build_step_weights(loss_cfg: dict, num_steps: int, epoch: int):
+    # base weights
+    step_agg = loss_cfg.get("step_agg", {})
+    if not step_agg.get("enabled", True):
+        w = torch.ones(num_steps, dtype=torch.float32)
+    else:
+        weight_type = step_agg.get("weight_type", "exp_decay")
+        cap_step = int(step_agg.get("cap_step", num_steps - 1))
+        min_w = float(step_agg.get("min_weight", 0.0))
+        max_w = float(step_agg.get("max_weight", 1e9))
+
+        if weight_type == "exp_decay":
+            base = float(step_agg.get("base", 1.0))
+            w = []
+            for i in range(num_steps):
+                eff_i = min(i, cap_step)
+                w.append(base ** eff_i)
+            w = torch.tensor(w, dtype=torch.float32)
+        elif weight_type == "uniform":
+            w = torch.ones(num_steps, dtype=torch.float32)
+        else:
+            raise ValueError(f"Unknown weight_type: {weight_type}")
+
+        w = torch.clamp(w, min=min_w, max=max_w)
+
+    # step0 boost
+    s0 = loss_cfg.get("step0_boost", {})
+    if s0.get("enabled", False) and num_steps > 0:
+        mode = s0.get("mode", "linear_smooth")
+        start_mul = float(s0.get("start_multiplier", 1.0))
+        end_mul = float(s0.get("end_multiplier", 1.0))
+        over_epochs = int(s0.get("over_epochs", 1))
+
+        if mode == "linear_smooth":
+            # epoch 0 -> start_mul, epoch >= over_epochs -> end_mul
+            t = min(max(epoch, 0), over_epochs)
+            alpha = t / max(1, over_epochs)
+            mul = (1 - alpha) * start_mul + alpha * end_mul
+        elif mode == "constant":
+            mul = start_mul
+        else:
+            raise ValueError(f"Unknown step0_boost mode: {mode}")
+
+        w[0] *= mul
+
+    return w  # torch.float32 [num_steps]
+
+def per_step_loss_sum_and_count(loss_cfg: dict, logits: torch.Tensor, target: torch.Tensor, loss_mask: torch.Tensor):
+    """
+    logits: [BG, L, V] float
+    target: [BG, L] long
+    loss_mask: [BG, L] float/bool (1=active)
+    returns: (loss_sum, count) both scalars tensors
+    """
+    loss_type = loss_cfg.get("type", "token_nll")
+
+    if loss_type == "token_nll":
+        out_logp = F.log_softmax(logits, dim=-1)  # [BG, L, V]
+        target_logp = out_logp.gather(2, target.unsqueeze(-1)).squeeze(-1)  # [BG, L]
+        m = loss_mask.float()
+        loss_sum = -(target_logp * m).sum()
+        count = m.sum()
+
+    elif loss_type == "ce":
+        # standard CE, with mask applied manually
+        # NOTE: you can add label_smoothing support if needed
+        V = logits.size(-1)
+        logp = F.log_softmax(logits, dim=-1)
+        nll = -logp.gather(2, target.unsqueeze(-1)).squeeze(-1)  # [BG, L]
+        m = loss_mask.float()
+        loss_sum = (nll * m).sum()
+        count = m.sum()
+
+    else:
+        raise ValueError(f"Unknown loss.type: {loss_type}")
+
     return loss_sum, count
 
 def calculate_correct_counts(logits, target, loss_mask):
@@ -202,7 +280,6 @@ def denoise_k_step_soft_embed(
 
     return input_ids_next, input_emb_next, loss_mask_next
 
-
 def assert_module_on_device(module: torch.nn.Module, device: str, name: str):
     dev = next(module.parameters()).device
     if str(dev) != device:
@@ -237,14 +314,14 @@ def split_params(model):
         if not p.requires_grad:
             continue
         nl = n.lower()
-        if "lora" in nl:
+        if ("lm_head" in nl) or ("ff_out" in nl):
+            lm_head_params.append(p)
+        elif "lora" in nl:
             lora_params.append(p)
         elif "talk_model" in nl:
             talk_params.append(p)
-        elif ("lm_head" in nl) or ("ff_out" in nl):
-            lm_head_params.append(p)
         else:
-            other_trainable.append(p)  # e.g. fc if it's outside talk_model, etc.
+            other_trainable.append(p)
 
     return talk_params, lora_params, lm_head_params, other_trainable
 
@@ -255,16 +332,19 @@ def main():
     SEED = 0
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trainpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset")
-    parser.add_argument("--testpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset")
+    parser.add_argument("--trainpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset,allenai/tulu-3-sft-mixture")
+    parser.add_argument("--testpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset,allenai/tulu-3-sft-mixture")
+    parser.add_argument("--split", type=str, default="chat,train")
     parser.add_argument("--savedir", type=str, default="0")
     parser.add_argument("--training_config", type=str, default="train/train_config.json")
     parser.add_argument("--model_config", type=str, default="model/config.json")
-    parser.add_argument("--think_device", type=str, default="cuda:3")
-    parser.add_argument("--talk_device", type=str, default="cuda:2")
+    parser.add_argument("--think_device1", type=str, default="cuda:2")
+    parser.add_argument("--think_device2", type=str, default="cuda:3")
+    parser.add_argument("--talk_device", type=str, default="cuda:1")
     args = parser.parse_args()
     
-    THINK_DEVICE = args.think_device
+    THINK_DEVICE1 = args.think_device1
+    THINK_DEVICE2 = args.think_device2
     TALK_DEVICE = args.talk_device
     VIS_EVERY_OPT_STEP = 2000     # optimiser steps
     VIS_MAX_STEPS = 16            # denoise steps to print (avoid huge logs)
@@ -281,10 +361,16 @@ def main():
     training_parameters = AttrDict(train_config["training_parameters"])
     with open(args.model_config) as f:
         model_config = json.load(f)
-    assert model_config["length"] == train_config["data"]["block_size"], "model decoding length should be the same as block_size"
-    model_config['use_residual'] = train_config['rps_residual']['enabled']
-
-
+    
+    # copy model related parameter from train_config
+    model_config["length"] = train_config["data"]["block_size"]
+    model_config["prune_last_n_layer"] = train_config["prune_last_n_layer"]
+    model_config["mix_indexes"] = train_config["mix_indexes"]
+    model_config["denoise"] = train_config["denoise"]
+    if train_config["lora"]["enabled"]:
+        model_config['lora'] = train_config["lora"]
+    if train_config['rps_residual']['enabled']:
+        model_config['rps_residual'] = train_config['rps_residual']
     # -------------------------
     # Model
     # -------------------------
@@ -292,7 +378,7 @@ def main():
         args.savedir = f'{training_parameters["wandb_name"]}-{train_config["data"]["block_size"]}-{train_config["data"]["block_num"]}-{train_config["gradient_accumulation_steps"]}'
     os.makedirs(args.savedir, exist_ok=True)
 
-    model = T3Model(model_config, think_dev=THINK_DEVICE, talk_dev=TALK_DEVICE)
+    model = T3Model(model_config, think_dev1=THINK_DEVICE1, think_dev2=THINK_DEVICE2, talk_dev=TALK_DEVICE)
 
     freeze_parameters(model)
 
@@ -310,11 +396,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_config["pretrained_model_name_or_path"], trust_remote_code=True)
 
     traindataset = build_dataset_rank(
-        tokenizer, args.trainpath, training_parameters["max_len"], target_len=train_config["data"]["block_size"]*train_config["data"]["block_num"],
+        tokenizer, args.trainpath, training_parameters["max_len"], target_len=train_config["data"]["block_size"]*train_config["data"]["block_num"], splits=args.split,
         get_test_subset=False, seed=SEED
     )
     testdataset = build_dataset_rank(
-        tokenizer, args.testpath, training_parameters["max_len"], target_len=train_config["data"]["block_size"]*train_config["data"]["block_num"],
+        tokenizer, args.testpath, training_parameters["max_len"], target_len=train_config["data"]["block_size"]*train_config["data"]["block_num"], splits=args.split,
         get_test_subset=True, seed=SEED
     )
     print(f"Train data: {len(traindataset)}, Test data: {len(testdataset)}")
@@ -352,7 +438,7 @@ def main():
     print(f"other trainable params: {sum(p.numel() for p in other_params):,}")
     
     param_groups = [{"name": "talk", "params": talk_params + other_params, "lr": lr_dict['talk'], "weight_decay": weight_decay["talk"]}]
-    if train_config["use_lora"]["enabled"]:
+    if train_config["lora"]["enabled"]:
         param_groups.append({"name": "lora", "params": lora_params, "lr": lr_dict["lora"], "weight_decay": weight_decay["lora"]})
     if train_config["train_lm_head"]["enabled"]:
         param_groups.append({"name": "lm_head", "params": lm_head_params, "lr": lr_dict["lm_head"], "weight_decay": weight_decay["lm_head"]})
@@ -401,6 +487,8 @@ def main():
         else:
             model.eval()
 
+        loss_cfg = train_config.get("loss", {})
+
         epoch_acces = [[] for _ in range(model.length)]
         epoch_plosses = [[] for _ in range(model.length)]
 
@@ -411,13 +499,10 @@ def main():
         for batch_idx, data in enumerate(pbar):
             do_vis = (train and (global_step % VIS_EVERY_OPT_STEP == 0) and ((batch_idx) % grad_accum == 0))
 
-            # Build device-specific masks
-            mask_bool_think = data["loss_mask"].to(THINK_DEVICE, non_blocking=True).bool()  # [B, S+C]
-
             # Thought inputs on THINK_DEVICE
-            input_ids_think = data["input_ids"].to(THINK_DEVICE, non_blocking=True)
-            attn_think      = data["attention_mask"].to(THINK_DEVICE, non_blocking=True)
-            bias_think      = data["attention_bias"].to(THINK_DEVICE, non_blocking=True)
+            input_ids_think = data["input_ids"].to(THINK_DEVICE1, non_blocking=True)
+            attn_think      = data["attention_mask"].to(THINK_DEVICE1, non_blocking=True)
+            bias_think      = data["attention_bias"].to(THINK_DEVICE1, non_blocking=True)
 
             # -----------------
             # Think forward
@@ -434,7 +519,6 @@ def main():
             think_rps = think_outputs.hidden_states  # [B, S+C, H] on THINK_DEVICE
             B = think_rps.size(0)
             H = think_rps.size(-1)
-            think_rps = think_rps[mask_bool_think].view(B, -1, H)  # [B, L, H]
 
             # plosses = []
             loss_sums = []
@@ -447,11 +531,14 @@ def main():
             # Target on TALK_DEVICE (assumed [B, L] == [B, C])
             target_talk = data["target"].to(TALK_DEVICE, non_blocking=True)
             target_talk = target_talk.view(-1, model.length)  #[B * G, L]
+            # Build device-specific masks
+            mask_bool_talk = data["loss_mask"].to(TALK_DEVICE, non_blocking=True).bool()  # [B, S+C]
             # Build talk input_ids on TALK_DEVICE using talk mask
-            input_ids = input_ids_think[mask_bool_think].view(data["input_ids"].size(0), -1).to(TALK_DEVICE)  # [B, L]
+            input_ids = input_ids_think.to(TALK_DEVICE)[mask_bool_talk].view(data["input_ids"].size(0), -1)  # [B, L]
             input_ids = input_ids.view(-1, model.length) #[B * G, L]
             # Move rps once to TALK_DEVICE
             rps = think_rps.to(TALK_DEVICE, non_blocking=True)
+            rps = rps[mask_bool_talk].view(B, -1, H)  # [B, L, H]
             rps = rps.view(-1, model.length, rps.shape[-1])  #[B * G, L]
             # Build attention mask for talk (all ones) on TALK_DEVICE
             talk_attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=TALK_DEVICE)
@@ -482,10 +569,18 @@ def main():
                     )
                     logits = talk_outputs.logits.float()
                     rps = talk_outputs.hidden_states
-                    out_logp = F.log_softmax(logits, dim=-1)
+
+                    # out_logp = F.log_softmax(logits, dim=-1)
 
                     # loss_i = calculate_ploss(out_logp, target_talk, loss_mask)
-                    loss_sum_i, count_i = ploss_sum_and_count(out_logp, target_talk, loss_mask)
+                    # loss_sum_i, count_i = ploss_sum_and_count(out_logp, target_talk, loss_mask)
+                    loss_sum_i, count_i = per_step_loss_sum_and_count(
+                        loss_cfg=loss_cfg,
+                        logits=logits,
+                        target=target_talk,
+                        loss_mask=loss_mask,
+                    )
+
                     correct, total = calculate_correct_counts(logits, target_talk, loss_mask)
 
                     # plosses.append(loss_i)
@@ -499,14 +594,15 @@ def main():
                     
                     # denoise step updates input_ids + loss_mask (both on TALK_DEVICE)
                     if train_config["soft_inputs"]["enabled"]:
-                        input_ids, input_embeds, loss_mask = denoise_k_step_soft_embed(
+                        input_ids, input_embeds, loss_mask = denoise_k_step_soft_embed_v2(
                                 input_ids=input_ids,
                                 target=target_talk,
                                 loss_mask=loss_mask,
                                 logits=logits,
                                 emb_weight=model.talk_embed_weight,
-                                topk=train_config["soft_inputs"]["top_k"],
-                                temperature=train_config["soft_inputs"]["temperature"]
+                                soft_topk=train_config["soft_inputs"]["top_k"],
+                                soft_temp=train_config["soft_inputs"]["temperature"],
+                                mode=train_config["denoise"]["reveal_strategy"]
                             )
                     else:
                         input_ids, loss_mask = denoise_k_step(input_ids, target_talk, loss_mask)
@@ -514,14 +610,30 @@ def main():
                     
                     if train_config["detach_recurrence"]["enabled"] and ((idx + 1) % train_config["detach_recurrence"]["every_r_steps"] == 0):
                         rps, input_embeds = detach_state(rps, input_embeds)
-
+                
+                # Version 1
                 # ploss_weight = [0.8 ** i if i < 10 else 0.8 ** 10 for i in range(len(plosses))]
                 # loss = sum(ploss_weight[i] * plosses[i] for i in range(len(plosses)))
-                w = [0.8 ** i if i < 10 else 0.8 ** 10 for i in range(len(loss_sums))]
-                w[0] *= max(1, 5 - epoch_num)
-                weighted_loss_sum = sum(w[i] * loss_sums[i] for i in range(len(loss_sums)))
-                weighted_count    = sum(w[i] * counts[i]     for i in range(len(counts)))
-                loss = weighted_loss_sum / weighted_count.clamp_min(1e-6)
+                
+                # Version 2
+                # w = [0.8 ** i if i < 10 else 0.8 ** 10 for i in range(len(loss_sums))]
+                # w[0] *= max(1, 5 - epoch_num)
+                # weighted_loss_sum = sum(w[i] * loss_sums[i] for i in range(len(loss_sums)))
+                # weighted_count    = sum(w[i] * counts[i]     for i in range(len(counts)))
+                # loss = weighted_loss_sum / weighted_count.clamp_min(1e-6)
+
+                # Version 3
+                w = build_step_weights(loss_cfg, num_steps=len(loss_sums), epoch=epoch_num).to(TALK_DEVICE)
+
+                weighted_loss_sum = torch.zeros((), device=TALK_DEVICE, dtype=torch.float32)
+                weighted_count    = torch.zeros((), device=TALK_DEVICE, dtype=torch.float32)
+
+                for i in range(len(loss_sums)):
+                    weighted_loss_sum = weighted_loss_sum + w[i] * loss_sums[i]
+                    weighted_count    = weighted_count    + w[i] * counts[i]
+
+                clamp_min = float(loss_cfg.get("normalize", {}).get("count_clamp_min", 1e-6))
+                loss = weighted_loss_sum / weighted_count.clamp_min(clamp_min)
 
                 if train:
                     loss = loss / grad_accum
@@ -532,6 +644,14 @@ def main():
                         scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
                         global_step += 1
+
+            # record batch stats (move scalar to cpu)
+            for i in range(len(acces)):
+                batch_acces[i].append(acces[i])
+            # for i in range(len(plosses)):
+            #     batch_plosses[i].append(plosses[i].detach().item())
+            for i in range(len(loss_sums)):
+                batch_plosses[i].append(loss_sums[i].detach().item() / counts[i].detach().item())
 
             if (batch_idx + 1) % grad_accum == 0:
                 batch_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_acces]
@@ -551,14 +671,7 @@ def main():
                     for i, a in enumerate(batch_acc_mean):
                         logdict[f"train/acc_{i:02d}"] = float(a)
                     wandb.log(logdict)
-            else:
-                # record batch stats (move scalar to cpu)
-                for i in range(len(acces)):
-                    batch_acces[i].append(acces[i])
-                # for i in range(len(plosses)):
-                #     batch_plosses[i].append(plosses[i].detach().item())
-                for i in range(len(loss_sums)):
-                    batch_plosses[i].append(loss_sums[i].detach().item() / counts[i].detach().item())
+                
 
             if do_vis:
                 visualize_t3_batch_trace(
@@ -620,10 +733,12 @@ def main():
             optimizer,
             scheduler,
             extra={
-                "think_device": THINK_DEVICE,
+                "think_device1": THINK_DEVICE1,
+                "think_device2": THINK_DEVICE2,
                 "talk_device": TALK_DEVICE,
                 "global_step": global_step,
-            }
+            },
+            model_config=model_config
         )
 
     print("\nDone.")

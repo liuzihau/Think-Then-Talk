@@ -1,6 +1,6 @@
 from abc import abstractmethod
 import math
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple, Dict
 import logging
 # from dataclasses import fields
 
@@ -506,7 +506,6 @@ class TalkModel(nn.Module):
         self.fc = nn.Linear(config.d_model * 3, config.d_model)
         self.rps_norm = LayerNorm.build(config)  # same LN type as model uses
         self.rps_gate = nn.Linear(config.d_model, config.d_model)  # or to 1 for scalar gate
-        self.rps_residual_eta = 0.2
         self.rps_post_norm = LayerNorm.build(config)  # in __init__
 
         # When `init_device="meta"` FSDP will call `reset_parameters()` to initialize weights.
@@ -598,7 +597,7 @@ class TalkModel(nn.Module):
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,
-        use_residual: bool = False,
+        rps_residual: Dict = None,
     ):
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -806,11 +805,11 @@ class TalkModel(nn.Module):
         # if self.config.scale_logits:
         #     logits.mul_(1 / math.sqrt(self.config.d_model))
 
-        if use_residual and output_hidden_states:
+        if rps_residual["enabled"] and output_hidden_states:
             rps_in = self.rps_norm(input_repres)
             x_last = all_hidden_states[-1]  # post ln_f
             gate = torch.sigmoid(self.rps_gate(x_last))
-            rps_next = rps_in + self.rps_residual_eta * gate * x_last
+            rps_next = rps_in + rps_residual["eta"] * gate * x_last
             # keep in same space
             rps_next = self.rps_post_norm(rps_next)
             all_hidden_states[-1] = rps_next
@@ -825,19 +824,18 @@ class T3Model(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         device_map: str | dict = "auto",
         train: bool = True,
-        think_dev: str = "cuda:1",
+        think_dev1: str = "cuda:1",
+        think_dev2: str = "cuda:2",
         talk_dev: str = "cuda:0"
     ):
         super().__init__()
         
         self.is_training_mode = train
-        self.think_dev = think_dev
+        self.think_dev1 = think_dev1
+        self.think_dev2 = think_dev2
         self.talk_dev = talk_dev
-        self.device = self.think_dev
+        self.device = self.think_dev1
 
-        # temperary turn off device_map
-        # if self.is_training_mode:
-        #     device_map = None
         device_map = None
 
         # Length
@@ -846,12 +844,18 @@ class T3Model(nn.Module):
         # Think model
         self.architecture = self._register(config["pretrained_model_name_or_path"])
         self.think_model = self._load_model(config["pretrained_model_name_or_path"],dtype=dtype, device_map=device_map)
-        if config["lora"]["enable"]:
+        if config["lora"]["enabled"]:
             self._add_lora(config.get("lora", {}))
             self.think_model_root = self.think_model.base_model.model
         else:
             self.think_model_root = self.think_model
-        self.think_model.to(self.think_dev)
+        # self.think_model.to(self.think_dev1)
+        self.think_model_root.model.set_pipeline(
+            split_points=(config["lora"]["start_layer"],),  # e.g. 20
+            devices=(self.think_dev1, self.think_dev2),     # 2 devices for 1 split
+        )
+        self.think_model_root.model.move_blocks()
+        self.think_model_root.model.set_recorded_hidden_index(config["mix_indexes"])
 
         # Talk model
         talk_config = LLaDAModelConfig(**config["talk_model"])
@@ -860,10 +864,10 @@ class T3Model(nn.Module):
         self.talk_model.to(self.talk_dev)
 
         # structure
-        self.use_residual = config["use_residual"]
+        self.rps_residual = config["rps_residual"]
 
         # For train / inference efficient
-        if self.think_dev != self.talk_dev:
+        if self.think_dev1 != self.talk_dev or self.think_dev2 != self.talk_dev:
             # copy embed
             if self.architecture == "Qwen3":
                 self.talk_embed_weight = self.think_model_root.model.embed_tokens.weight.detach()
@@ -896,9 +900,9 @@ class T3Model(nn.Module):
 
         # Actions for limited memory resource
         if self.architecture == "LLaDA":
-            if hasattr(self.think_model_root.model.transformer, "ff_out") and self.think_dev != self.talk_dev:
+            if hasattr(self.think_model_root.model.transformer, "ff_out") and self.think_dev2 != self.talk_dev:
                 del self.think_model_root.model.transformer.ff_out
-            self.prune_llada_last_n_blocks(4)
+            self.prune_llada_last_n_blocks(config["prune_last_n_layer"])
             from model.LLaDA.configuration_llada import ActivationCheckpointingStrategy
             self.think_model_root.model.set_activation_checkpointing(
                 ActivationCheckpointingStrategy.whole_layer
@@ -1004,6 +1008,7 @@ class T3Model(nn.Module):
             target_modules=target_modules,
             bias=lora_cfg.get("bias", "none"),   # "none" | "all" | "lora_only"
             inference_mode=False,
+            use_dora=lora_cfg.get("use_dora", False)
         )
 
         self.think_model = get_peft_model(self.think_model, peft_config)
@@ -1072,8 +1077,9 @@ class T3Model(nn.Module):
         """
         Use EAGLE3 logic: fuse first, mid, last hidden representation
         """
-        assert len(hidden_states) == 3 
-        rps = torch.concat([hidden_states[0], hidden_states[1], hidden_states[-1]], dim=-1)
+        assert len(hidden_states) == 3
+        dev_out = hidden_states[-1].device
+        rps = torch.concat([hidden_states[0].to(dev_out), hidden_states[1].to(dev_out), hidden_states[-1]], dim=-1)
 
         # one_third = len(hidden_states) // 3
         # two_third = 2 * len(hidden_states) // 3
@@ -1111,7 +1117,7 @@ class T3Model(nn.Module):
                 last_logits_only=last_logits_only,
                 output_hidden_states=output_hidden_states,
                 replace_position=replace_position,
-                use_residual=self.use_residual
+                rps_residual=self.rps_residual
                 )
             
         return outputs

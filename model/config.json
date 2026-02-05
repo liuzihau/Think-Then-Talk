@@ -8,18 +8,12 @@
         "LLaDA": "",
         "Qwen3": "lm_head"
     },
-    "lora":{
-        "enable": true,
-        "start_layer": 26,
-        "r": 8,
-        "alpha": 16,
-        "dropout": 0.05,
-        "target_modules": {
-            "LLaDA": ["q_proj", "k_proj", "v_proj","up_proj","attn_out"],
-            "Qwen3": ["q_proj", "k_proj", "v_proj", "o_proj","gate_proj", "up_proj", "down_proj"]
-        }
+    "lora": {
+        "enabled":false
     },
-    "length": 8,
+    "length": null,
+    "mix_indexes": null,
+    "prune_last_n_layer": 2,
     "talk_model": {
         "activation_type": "silu",
         "alibi": false,
@@ -63,6 +57,11 @@
         "vocab_size": 126464,
         "weight_tying": false
     },
-    "use_residual": true,
-    "state_dir": "lora-2-decoder-layer-r-s-d-8-32-2/state_3"
+    "rps_residual": {
+        "enabled": false
+    },
+    "soft_inputs":{
+        "enabled":false
+    },
+    "state_dir": "lora-2-decoder-layer-r-s-d-8-32-2/state_6"
 }

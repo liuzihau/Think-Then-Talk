@@ -1,195 +1,290 @@
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, concatenate_datasets
 import numpy as np
 import matplotlib.pyplot as plt
 
 
 def build_dataset_rank(
     tokenizer,
-    datapath: str,
+    datapaths: str,
     max_len: int,
     target_len: int,
     *,
-    split: str = "chat",
+    splits: str = "chat",
     cache_root: str = "./hf_datasets_cache",
     num_proc: int = 8,
-    test_split_ratio: float = 0.05,  # e.g., 5% for testing
-    get_test_subset: bool = False,   # Set True to get the test split
-    seed: int = 42,                  # Fixed seed is CRITICAL for reproducibility
+    test_split_ratio: float = 0.05,
+    get_test_subset: bool = False,
+    seed: int = 42,
 ):
     """
-    datapath:
-      - local path to a dataset saved with save_to_disk(), OR
-      - HF Hub dataset name (optionally with config, e.g. "org/name" or "org/name:config")
+    datapaths:
+      - comma-separated list of:
+        - local path to a dataset saved with save_to_disk(), OR
+        - HF Hub dataset name (optionally with config, e.g. "org/name" or "org/name:config")
 
-    Behavior:
-      - If local path exists -> load_from_disk(datapath)
-      - Else -> download via load_dataset(...) and save_to_disk(...) under cache_root,
-                then load_from_disk(...) (so next run is offline / faster)
+    Output format (unchanged):
+      - HuggingFace Dataset with columns: ["input_ids", "target", "attention_mask"]
+      - set_format(type="torch") is applied before returning
+
+    Caching:
+      1) raw dataset cached to disk under cache_root/<repo_or_path>/<split>
+      2) processed dataset cached to disk under cache_root/processed/<cache_key>/(train|test)
     """
 
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+    SYSTEM_PROMPT = (
+        "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  "
+        "Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. "
+        "Please ensure that your responses are socially unbiased and positive in nature.\n\n"
+        "If a question does not make any sense, or is not factually coherent, explain why instead of answering something "
+        "not correct. If you don't know the answer to a question, please don't share false information."
+    )
+
+    SEP = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    ROLES_OK = {"human", "user", "gpt", "assistant"}
+
     def _is_local_saved_dataset(p: str) -> bool:
-        # load_from_disk expects a directory created by save_to_disk()
-        # Check common marker files/dirs.
         path = Path(p)
         if not path.exists() or not path.is_dir():
             return False
-        return (path / "dataset_info.json").exists() or (path / "state.json").exists() or (path / "data").exists()
+        return (
+            (path / "dataset_info.json").exists()
+            or (path / "state.json").exists()
+            or (path / "data").exists()
+        )
 
-    def _parse_hf_id(s: str):
-        # Allow "repo_id" or "repo_id:config"
+    def _parse_hf_id(s: str) -> Tuple[str, Optional[str]]:
+        s = s.strip()
         if ":" in s:
             repo_id, config = s.split(":", 1)
             repo_id, config = repo_id.strip(), config.strip()
             return repo_id, (config if config else None)
-        return s.strip(), None
+        return s, None
 
     def _safe_dirname(s: str) -> str:
-        # filesystem-safe stable name
         s = s.strip()
-        s = re.sub(r"[^\w\-.]+", "_", s)
-        return s
+        return re.sub(r"[^\w\-.]+", "_", s)
 
-    # 1) Resolve dataset source -> local on-disk path
-    if _is_local_saved_dataset(datapath):
-        local_path = Path(datapath)
-        ds = load_from_disk(str(local_path))
-    else:
-        # Not a local saved dataset; treat as HF dataset id and cache it to disk.
-        repo_id, config = _parse_hf_id(datapath)
+    def _ensure_pad_token():
+        # keep your behaviour: if pad token missing, use unk
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.unk_token_id
 
-        cache_root = Path(cache_root)
-        cache_root.mkdir(parents=True, exist_ok=True)
+    def _apply_chat_template(messages: List[Dict[str, str]]) -> str:
+        # keep your behaviour: apply_chat_template + removesuffix(assistant header)
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        ).removesuffix("<|start_header_id|>assistant<|end_header_id|>\n\n")
 
-        cache_key = repo_id if config is None else f"{repo_id}:{config}"
-        local_path = cache_root / _safe_dirname(cache_key) / split
+    def _tokenize_ids(text: str) -> List[int]:
+        _ensure_pad_token()
+        ids = tokenizer(
+            text,
+            return_tensors=None,          # return python lists
+            add_special_tokens=False,
+        )["input_ids"]
+        # tokenizer can return list[int] for single string
+        return ids
 
-        if _is_local_saved_dataset(str(local_path)):
-            ds = load_from_disk(str(local_path))
+    def _build_prompt_and_target(conversation: str) -> Optional[Tuple[List[int], List[int], List[int]]]:
+        """
+        Convert a full conversation string (ending with an assistant answer)
+        into:
+          input_ids: prompt ids (up to assistant header)
+          target: assistant answer token ids
+          attention_mask: ones for prompt length
+        Returns None if filtered out.
+        """
+        full_ids = _tokenize_ids(conversation)
+
+        if len(full_ids) > max_len:
+            return None
+
+        turns = conversation.split(SEP)
+        if len(turns) < 2:
+            return None
+
+        prompt = ""
+        for turn in turns[:-1]:
+            prompt += turn + SEP
+
+        input_ids = _tokenize_ids(prompt)
+        target = full_ids[len(input_ids):]
+
+        if len(target) < target_len:
+            return None
+
+        attention_mask = [1] * len(input_ids)
+        return input_ids, target, attention_mask
+
+    # -----------------------------
+    # Dataset-specific “adapters”
+    # -----------------------------
+    def _iter_conversations_from_batch(datapath: str, examples: Dict) -> List[str]:
+        """
+        Produce a list of conversation strings to be turned into (prompt, target).
+        Each string is a full conversation that includes the assistant answer at the end.
+        """
+        conversations: List[str] = []
+
+        if datapath == "nvidia/Llama-Nemotron-Post-Training-Dataset":
+            data_pts = len(examples.get("input", []))
+            for i in range(data_pts):
+                source = examples["input"][i]
+                response = examples["output"][i]
+
+                if not source or source[0].get("role") not in ROLES_OK:
+                    # keep your debug print behaviour, but avoid crashing
+                    try:
+                        print(source[0].get("role"))
+                    except Exception:
+                        print("bad_source_role")
+                    continue
+
+                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                for msg in source:
+                    messages.append({"role": msg["role"], "content": msg["content"]})
+                messages.append({"role": "assistant", "content": response})
+
+                conversations.append(_apply_chat_template(messages))
+
+            return conversations
+
+        if datapath == "allenai/tulu-3-sft-mixture":
+            data_pts = len(examples.get("messages", []))
+            for i in range(data_pts):
+                source = examples["messages"][i]
+                if not source:
+                    continue
+
+                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                if source[0].get("role") == "system":
+                    messages[0] = source[0]
+                    source = source[1:]
+
+                # Create a training instance at every assistant turn (same as your original)
+                for msg in source:
+                    messages.append({"role": msg["role"], "content": msg["content"]})
+                    if msg.get("role") == "assistant":
+                        conversations.append(_apply_chat_template(messages))
+
+            return conversations
+
+        raise ValueError(f"Unsupported datapath for preprocessing: {datapath}")
+
+    def _make_preprocess_fn(datapath: str) -> Callable[[Dict], Dict]:
+        """
+        Returns a batched map function producing exactly:
+          input_ids, target, attention_mask (lists, not tensors)
+        """
+        def _fn(examples: Dict) -> Dict:
+            new_examples = {"attention_mask": [], "target": [], "input_ids": []}
+
+            conversations = _iter_conversations_from_batch(datapath, examples)
+            for conv in conversations:
+                out = _build_prompt_and_target(conv)
+                if out is None:
+                    continue
+                input_ids, target, attention_mask = out
+                new_examples["input_ids"].append(input_ids)
+                new_examples["target"].append(target)
+                new_examples["attention_mask"].append(attention_mask)
+
+            return new_examples
+
+        return _fn
+
+    # -----------------------------
+    # Resolve datapaths
+    # -----------------------------
+    cache_root = Path(cache_root)
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    paths = [p.strip() for p in datapaths.split(",") if p.strip()]
+    all_splits = [p.strip() for p in splits.split(",") if p.strip()]
+
+    if not paths:
+        raise ValueError("datapaths is empty. Provide at least one dataset path or HF dataset id.")
+
+    final_ds = None
+
+    for datapath, split in zip(paths, all_splits):
+        # 1) Load raw dataset (from disk or HF and cache)
+        if _is_local_saved_dataset(datapath):
+            ds = load_from_disk(datapath)
         else:
-            # Download from HF and persist
-            if config is None:
-                ds_hf = load_dataset(repo_id, split=split)
+            repo_id, config = _parse_hf_id(datapath)
+            cache_key = repo_id if config is None else f"{repo_id}:{config}"
+            raw_local_path = cache_root / _safe_dirname(cache_key) / split
+
+            if _is_local_saved_dataset(str(raw_local_path)):
+                ds = load_from_disk(str(raw_local_path))
             else:
-                ds_hf = load_dataset(repo_id, config, split=split)
+                if config is None:
+                    ds_hf = load_dataset(repo_id, split=split)
+                else:
+                    ds_hf = load_dataset(repo_id, config, split=split)
 
-            local_path.mkdir(parents=True, exist_ok=True)
-            ds_hf.save_to_disk(str(local_path))
-            ds = load_from_disk(str(local_path))
+                raw_local_path.mkdir(parents=True, exist_ok=True)
+                ds_hf.save_to_disk(str(raw_local_path))
+                ds = load_from_disk(str(raw_local_path))
 
-    # 2) Normal pipeline (same spirit as EAGLE3)
-    
-    ds = ds.shuffle(seed=seed)
+        # 2) Shuffle then split (same logic)
+        ds = ds.shuffle(seed=seed)
 
-    # Perform the split logic only if requested
-    if test_split_ratio > 0 and len(ds) > 1:
-        # train_test_split is very efficient (just manipulates indices, doesn't copy data)
-        splits = ds.train_test_split(test_size=test_split_ratio, seed=seed)
-        
-        if get_test_subset:
-            ds1 = splits['test']
-            print(f"dataset rank: returning TEST split ({len(ds1)} examples)")
+        if test_split_ratio > 0 and len(ds) > 1:
+            splits = ds.train_test_split(test_size=test_split_ratio, seed=seed)
+            ds1 = splits["test"] if get_test_subset else splits["train"]
+            print(
+                f"dataset rank: returning {'TEST' if get_test_subset else 'TRAIN'} split ({len(ds1)} examples)"
+            )
         else:
-            ds1 = splits['train']
-            print(f"dataset rank: returning TRAIN split ({len(ds1)} examples)")
-    else:
-        # Fallback if ratio is 0 or dataset is too small
-        ds1 = ds
-        print(f"dataset rank: returning FULL dataset ({len(ds1)} examples)")
+            ds1 = ds
+            print(f"dataset rank: returning FULL dataset ({len(ds1)} examples)")
 
-    
-    original_columns1 = ds1.column_names
+        original_columns = ds1.column_names
 
-    def preprocess_function(examples):
-        new_examples = {
-            "attention_mask": [],
-            "target": [],
-            "input_ids": []
-        }
-        data_pts = len(examples['input'])
+        # 3) Processed caching (IMPORTANT: include tokenizer identity)
+        processed_root = cache_root / "processed"
+        processed_root.mkdir(parents=True, exist_ok=True)
 
-        # # TODO turn off debug
-        # data_pts = 8
-        
-        for i in range(data_pts):
-            messages = [
-                {"role": "system",
-                 "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
-            ]
-            convroles = ["user", "assistant"]
-            roles = {"human", "user", "gpt", "assistant"}
-            source = examples['input'][i]
-            response = examples['output'][i]
-            if not source or source[0]["role"] not in roles:
-                print(source[0]["role"])
-                continue
-            # if len(source) > 1:
-            #     print(len(source))
-            #     print(source)
-            for msg in source:
-                messages.append(
-                    {"role": msg["role"], "content": msg["content"]}
-                )
-            messages.append(
-                    {"role": "assistant", "content": response}
-                )
-            
-            conversation = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            ).removesuffix("<|start_header_id|>assistant<|end_header_id|>\n\n")
+        tok_id = getattr(tokenizer, "name_or_path", "unknown_tokenizer")
+        proc_key = _safe_dirname(f"{datapath}:{split}:{tok_id}:max{max_len}:tgt{target_len}:seed{seed}:v1")
+        processed_path = processed_root / proc_key / ("test" if get_test_subset else "train")
+        print(processed_path)
 
-            if not tokenizer.pad_token_id:
-                tokenizer.pad_token_id = tokenizer.unk_token_id
+        if _is_local_saved_dataset(str(processed_path)):
+            ds1_proc = load_from_disk(str(processed_path))
+        else:
+            preprocess_fn = _make_preprocess_fn(datapath)
 
-            full_ids = tokenizer(
-                conversation,
-                return_tensors="pt",
-                add_special_tokens=False,
-            ).input_ids[0]
+            ds1_proc = ds1.map(
+                preprocess_fn,
+                batched=True,
+                num_proc=num_proc,
+                remove_columns=original_columns,
+                load_from_cache_file=False,  # keep your behaviour: rely on save_to_disk instead
+            )
+            ds1_proc.save_to_disk(str(processed_path))
 
-            # filtering out the samples which is longer than max_len
-            if len(full_ids) > max_len:
-                continue
-            
-            
-            sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            turns = conversation.split(sep)
-            if len(turns) < 2:
-                continue
+        # 4) Output format unchanged
+        ds1_proc.set_format(type="torch")
 
-            prompt = ""
-            for turn in turns[:-1]:
-                prompt += turn + sep
-            input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids[0]
-            target = full_ids[len(input_ids):]
-            if target.shape[0] < target_len:
-                continue
+        # 5) Concat across datapaths
+        if final_ds is None:
+            final_ds = ds1_proc
+        else:
+            final_ds = concatenate_datasets([final_ds, ds1_proc])
 
-            attention_mask = torch.ones_like(input_ids).to(dtype=torch.bool)
-
-            # new_examples["conversation"].append(conversation)
-            new_examples["input_ids"].append(input_ids[None, :])
-            new_examples["target"].append(target[None, :])
-            new_examples["attention_mask"].append(attention_mask[None, :])
-
-
-        return new_examples
-
-    ds1 = ds1.map(
-        preprocess_function,
-        batched=True,
-        num_proc=num_proc,
-        remove_columns=original_columns1,
-        load_from_cache_file=False,
-    )
-
-    ds1.set_format(type="torch")
-    return ds1
+    return final_ds
 
 
 class DataCollatorWithPadding:
@@ -363,7 +458,7 @@ def build_block_attention_mask(
     return m
 
 class DataCollatorWithPaddingV2:
-    def __init__(self, block_size: int=32, block_num: int=8, mask_token_id: int=126336, pad_token_id: int=126081, start_end_ratio: float=0.1):
+    def __init__(self, block_size: int=32, block_num: int=8, mask_token_id: int=126336, pad_token_id: int=126081, start_end_ratio: float=0.2):
         self.block_size = block_size
         self.block_num = block_num
         self.total_length = self.block_size * self.block_num
@@ -430,7 +525,7 @@ class DataCollatorWithPaddingV2:
         # ---- allocate batch tensors (more efficient than per-item pad+cat)
         dtype_ids = input_ids_list[0].dtype  # usually torch.long
         batch_input_ids = torch.full((B, max_length), self.pad_token_id, dtype=dtype_ids, device=device)
-        batch_attention_mask = torch.zeros((B, max_length), dtype=attn_mask_list[0].dtype, device=device)
+        batch_attention_mask = torch.zeros((B, max_length), dtype=torch.bool, device=device)
         batch_attention_bias = torch.empty((B, 1, max_length, max_length), dtype=torch.float32, device=device)
         batch_loss_mask = torch.zeros((B, max_length), dtype=torch.long, device=device)  # usually bool/long
 
@@ -563,7 +658,7 @@ if __name__ == "__main__":
     from torch.utils.data import DataLoader
     tokenizer = AutoTokenizer.from_pretrained("GSAI-ML/LLaDA-8B-Instruct", trust_remote_code=True)
     testdataset = build_dataset_rank(
-        tokenizer, "nvidia/Llama-Nemotron-Post-Training-Dataset", 4096, 256,
+        tokenizer, "nvidia/Llama-Nemotron-Post-Training-Dataset,allenai/tulu-3-sft-mixture", 4096, 256, splits="chat,train",
         get_test_subset=True, seed=42
     )
     test_loader = DataLoader(
@@ -573,6 +668,7 @@ if __name__ == "__main__":
         pin_memory=True,
         collate_fn=DataCollatorWithPaddingV2()
     )
+    print(len(test_loader))
     for data in test_loader:
         for key in data:
             print(key, data[key].dtype)
