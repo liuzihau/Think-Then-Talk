@@ -371,6 +371,8 @@ def main():
         model_config['lora'] = train_config["lora"]
     if train_config['rps_residual']['enabled']:
         model_config['rps_residual'] = train_config['rps_residual']
+    if train_config['soft_inputs']['enabled']:
+        model_config['soft_inputs'] = train_config['soft_inputs']
     # -------------------------
     # Model
     # -------------------------

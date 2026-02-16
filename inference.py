@@ -6,7 +6,7 @@ from model.modeling_t3 import T3Model
 from utils import load_ckpt, denoise_k_step_soft_embed_v2
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--ckpt_path", type=str, default="lora-2-decoder-layer-r-s-d-new-loss-8-32-2/state_6")
+parser.add_argument("--ckpt_path", type=str, default="cfg5-8-32-2/state_0")
 parser.add_argument("--gen_length", type=int, default=128)
 parser.add_argument("--steps", type=int, default=128)
 parser.add_argument("--block_size", type=int, default=8)
@@ -51,7 +51,7 @@ x = torch.full((input_ids.shape[0], max_len), MASK_TOKEN_ID, dtype=torch.long).t
 attention_mask = torch.ones_like(x, dtype=torch.bool, device=THINK_DEVICE1)
 attention_bias = torch.zeros((x.shape[-1], x.shape[-1]), dtype=torch.bool, device=THINK_DEVICE1)
 attention_bias[:seq_len, :seq_len] = True
-for block_idx in range(GEN_LEN // args.block_size -1):
+for block_idx in range(GEN_LEN // args.block_size):
     attention_bias[seq_len + block_idx * args.block_size:seq_len + (block_idx + 1) * args.block_size, :seq_len + (block_idx + 1) * args.block_size] = True
 
 x[:, :seq_len] = input_ids.clone()
@@ -96,7 +96,7 @@ for block_idx in range(GEN_LEN // args.block_size):
         talk_rps = talk_rps.to(TALK_DEVICE)
     
     talk_attn_mask = torch.ones_like(talk_input_ids, dtype=torch.long, device=TALK_DEVICE)
-    talk_attn_bias = torch.zeros((1, 1, args.block_size,args.block_size), device=TALK_DEVICE, dtype=torch.float32)
+    talk_attn_bias = torch.zeros((1, 1, args.block_size, args.block_size), device=TALK_DEVICE, dtype=torch.float32)
     loss_mask = torch.ones_like(talk_attn_mask, dtype=torch.float32, device=TALK_DEVICE)
 
     talk_input_embeds = F.embedding(talk_input_ids, model.talk_embed_weight)  # initial emb (step 0)
@@ -123,7 +123,7 @@ for block_idx in range(GEN_LEN // args.block_size):
                     emb_weight=model.talk_embed_weight,
                     soft_topk=model_config["soft_inputs"]["top_k"],
                     soft_temp=model_config["soft_inputs"]["temperature"],
-                    mode="greedy",
+                    mode="ar_force",
                     sample_tokens=False,
                     # temperature=0.1,
                     # top_p=0.9
