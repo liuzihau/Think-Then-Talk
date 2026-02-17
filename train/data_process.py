@@ -16,7 +16,7 @@ def build_dataset_rank(
     splits: str = "chat",
     cache_root: str = "./hf_datasets_cache",
     num_proc: int = 8,
-    test_split_ratio: float = 0.0001, #0.05
+    test_split_ratio: float = 0.05,
     get_test_subset: bool = False,
     seed: int = 42,
 ):
@@ -242,8 +242,7 @@ def build_dataset_rank(
 
         if test_split_ratio > 0 and len(ds) > 1:
             splits = ds.train_test_split(test_size=test_split_ratio, seed=seed)
-            # ds1 = splits["test"] if get_test_subset else splits["train"]
-            ds1 = splits["test"]
+            ds1 = splits["test"] if get_test_subset else splits["train"]
             print(
                 f"dataset rank: returning {'TEST' if get_test_subset else 'TRAIN'} split ({len(ds1)} examples)"
             )
@@ -459,14 +458,16 @@ def build_block_attention_mask(
     return m
 
 class DataCollatorWithPaddingV2:
-    def __init__(self, block_size: int=32, block_num: int=8, mask_token_id: int=126336, pad_token_id: int=126081, start_end_ratio: float=0.2):
+    def __init__(self, block_size: int=32, block_num: int=8, mask_token_id: int=126336, pad_token_id: int=126081, eos_token_id: int=126081, start_end_ratio: float=0.2, max_start_mode: str="exceed_end"):
         self.block_size = block_size
         self.block_num = block_num
         self.total_length = self.block_size * self.block_num
         self.mask_token_id = mask_token_id
         self.pad_token_id = pad_token_id
+        self.eos_token_id = eos_token_id if eos_token_id is not None else pad_token_id
         self.neg_inf = torch.finfo(torch.float32).min
         self.start_end_ratio = start_end_ratio
+        self.max_start_mode = max_start_mode
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         # ---- helpers: accept [T] or [1,T] and always use [T]
@@ -490,10 +491,14 @@ class DataCollatorWithPaddingV2:
         
         # ---- sample start indices uniformly for each example
         # valid starts: 0..Ti-length (inclusive) => count = Ti-length+1
-        max_starts = torch.tensor(
-            [max(t.size(0) - self.block_size * self.block_num + 1, 1) for t in target_list],
-            device=device
+        normal_max_starts = torch.tensor(
+                [max(t.size(0) - self.block_size * self.block_num + 1, 1) for t in target_list],
+                device=device
         )  # [B], clamp to >=1 to avoid errors if Ti < length
+        end_max_starts = torch.tensor(
+                [max(t.size(0) - self.block_size * self.block_num // 2 + 1, 1)for t in target_list],
+                device=device
+        )
 
         # uniform integer in [0, max_starts[i)-1]
         roll = torch.rand(B, device=device)
@@ -506,11 +511,11 @@ class DataCollatorWithPaddingV2:
         mask_rand  = ~(mask_start | mask_end)
 
         starts[mask_start] = 0
-        starts[mask_end]   = max_starts[mask_end] - 1
+        starts[mask_end]   = end_max_starts[mask_end] - 1
 
         # independent uniform draw for random region
         u = torch.rand(mask_rand.sum(), device=device)
-        starts[mask_rand] = (u * max_starts[mask_rand].float()).long()
+        starts[mask_rand] = (u * normal_max_starts[mask_rand].float()).long()
 
         for b in range(B):
             starts[b] =  (starts[b] // self.block_size) * self.block_size
@@ -544,18 +549,24 @@ class DataCollatorWithPaddingV2:
 
             s = int(starts[i].item())
             # clamp in case tgt shorter than length
-            s = (min(s, max(tgt.size(0) - self.total_length, 0)) // self.block_size) * self.block_size
+            # s = (min(s, max(tgt.size(0) - self.total_length, 0)) // self.block_size) * self.block_size
 
             prefix = tgt[:s]  # [s]
             window = tgt[s:s + self.total_length]  # [length] (or shorter if tgt too short)
                         
             # if tgt is shorter than length, pad window (rare if your data is valid)
-            window_size = window.size(0)
-            if window_size < self.total_length:
-                window_size = (window.size(0) // self.block_size) * self.block_size
-                if window_size == 0:
-                    raise ValueError("a target window with size 0")
-                window = window[:window_size]
+            # window_size = window.size(0)
+            # if window_size < self.total_length:
+            #     window_size = (window.size(0) // self.block_size) * self.block_size
+            #     if window_size == 0:
+            #         raise ValueError("a target window with size 0")
+            #     window = window[:window_size]
+
+            real_len = window.size(0)
+            if real_len < self.total_length:
+                eos_pad = torch.full((self.total_length - real_len,), self.eos_token_id, dtype=tgt.dtype, device=device)
+                window = torch.cat([window, eos_pad], dim=0)
+            window_size = self.total_length
             
             seq = torch.cat([inp, prefix.to(dtype_ids), window[:-self.block_size], mask_tokens[:window_size]], dim=0)  # [seq_len]
             L = seq.size(0)

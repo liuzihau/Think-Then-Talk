@@ -1333,6 +1333,9 @@ class LLaDAModel(nn.Module):
                 if attention_bias is not None:
                     attention_bias = attention_bias.to(dev)
 
+            if position_ids is not None and position_ids.device != torch.device(dev):
+                position_ids = position_ids.to(dev)
+
             # Apply blocks one-by-one.
             if self.config.block_group_size == 1:
                 for block_idx in range(s, e): #enumerate(self.transformer.blocks):

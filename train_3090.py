@@ -334,8 +334,8 @@ def main():
     parser = argparse.ArgumentParser()
     # parser.add_argument("--trainpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset,allenai/tulu-3-sft-mixture")
     # parser.add_argument("--testpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset,allenai/tulu-3-sft-mixture")
-    parser.add_argument("--trainpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset")
-    parser.add_argument("--testpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset")
+    # parser.add_argument("--trainpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset")
+    # parser.add_argument("--testpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset")
     parser.add_argument("--split", type=str, default="chat,train")
     parser.add_argument("--savedir", type=str, default="0")
     parser.add_argument("--training_config", type=str, default="train/train_config.json")
@@ -365,6 +365,7 @@ def main():
         model_config = json.load(f)
     
     # copy model related parameter from train_config
+    model_config["train_dataset"] = train_config["data"]["train_dataset"]
     model_config["length"] = train_config["data"]["block_size"]
     model_config["prune_last_n_layer"] = train_config["prune_last_n_layer"]
     model_config["mix_indexes"] = train_config["mix_indexes"]
@@ -400,11 +401,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_config["pretrained_model_name_or_path"], trust_remote_code=True)
 
     traindataset = build_dataset_rank(
-        tokenizer, args.trainpath, training_parameters["max_len"], target_len=train_config["data"]["block_size"]*train_config["data"]["block_num"], splits=args.split,
+        tokenizer, train_config["data"]["train_dataset"], training_parameters["max_len"], target_len=train_config["data"]["block_size"]*train_config["data"]["block_num"], splits=args.split,
         get_test_subset=False, seed=SEED
     )
     testdataset = build_dataset_rank(
-        tokenizer, args.testpath, training_parameters["max_len"], target_len=train_config["data"]["block_size"]*train_config["data"]["block_num"], splits=args.split,
+        tokenizer, train_config["data"]["train_dataset"], training_parameters["max_len"], target_len=train_config["data"]["block_size"]*train_config["data"]["block_num"], splits=args.split,
         get_test_subset=True, seed=SEED
     )
     print(f"Train data: {len(traindataset)}, Test data: {len(testdataset)}")

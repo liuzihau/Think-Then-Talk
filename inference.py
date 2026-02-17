@@ -41,6 +41,26 @@ user_input = input("Enter your question: ")
 messages.append({"role": "user", "content": user_input})
 
 user_input = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+# user_input = """<|startoftext|><|start_header_id|>system<|end_header_id|>
+
+# You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.
+
+# If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+# [blog]:販売するサイト
+
+# [item]:まつ毛美容液
+# [age]:30歳から35歳のシングルマザー
+# [key]:まつ毛が育毛できる・長く見せることができる
+# [number]:30
+
+# [C1]=:最終的に[item]を[blog]を作りたいと思います。[age]に向けて[item]以外で[key]アイテム・サービスのネガティブな悩みから販売につなげたいと思います。具体的な悩みを[number]考えて下さい。。
+
+# &gt; Run[C1]copy<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+# **[C1] 実行結果: 悩みを販売につなげるアイデア集**
+
+# **最終目標:** `[item]` (まつ毛美容液) を販売する `[blog]` 作り、"""
 input_ids = tokenizer(user_input, return_tensors="pt", add_special_tokens=False).input_ids[0]
 input_ids = input_ids.to(THINK_DEVICE1).unsqueeze(0)
 seq_len = input_ids.shape[1]
@@ -48,6 +68,7 @@ max_len = seq_len + GEN_LEN
 
 start_time = time.time()
 x = torch.full((input_ids.shape[0], max_len), MASK_TOKEN_ID, dtype=torch.long).to(THINK_DEVICE1)
+position_ids = torch.arange(0, x.shape[1]).to(THINK_DEVICE1).unsqueeze(0)
 attention_mask = torch.ones_like(x, dtype=torch.bool, device=THINK_DEVICE1)
 attention_bias = torch.zeros((x.shape[-1], x.shape[-1]), dtype=torch.bool, device=THINK_DEVICE1)
 attention_bias[:seq_len, :seq_len] = True
@@ -57,6 +78,8 @@ for block_idx in range(GEN_LEN // args.block_size):
 x[:, :seq_len] = input_ids.clone()
 past_key_values = None
 x0 = x[:, :seq_len + args.block_size]
+p0 = position_ids[:, :seq_len + args.block_size]
+print(tokenizer.decode(x0[0].detach().view(-1).tolist()))
 attn_mask = attention_mask[:, :x0.shape[-1]]
 attn_bias = attention_bias[:x0.shape[-1], :x0.shape[-1]]
 attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)
@@ -66,6 +89,7 @@ for block_idx in range(GEN_LEN // args.block_size):
             input_ids=x0,
             attention_mask=attn_mask,
             attention_bias=attn_bias,
+            position_ids=p0,
             use_cache=True,
             past_key_values=past_key_values,
             output_hidden_states=True
@@ -125,7 +149,8 @@ for block_idx in range(GEN_LEN // args.block_size):
                     soft_temp=model_config["soft_inputs"]["temperature"],
                     mode="ar_force",
                     sample_tokens=False,
-                    # temperature=0.1,
+                    # repetition_penalty=1.4,
+                    # temperature=1,
                     # top_p=0.9
                 )
         else:
@@ -136,6 +161,7 @@ for block_idx in range(GEN_LEN // args.block_size):
     
     x[:, s:e] = talk_input_ids
     x0 = x[:, s:e + args.block_size]
+    p0 = position_ids[:, s:e + args.block_size]
     attn_mask = attention_mask[:, :e + args.block_size]
     attn_bias = attention_bias[:e + args.block_size, :e + args.block_size]
     attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)
