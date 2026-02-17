@@ -16,7 +16,7 @@ def build_dataset_rank(
     splits: str = "chat",
     cache_root: str = "./hf_datasets_cache",
     num_proc: int = 8,
-    test_split_ratio: float = 0.05,
+    test_split_ratio: float = 0.0001, #0.05
     get_test_subset: bool = False,
     seed: int = 42,
 ):
@@ -242,7 +242,8 @@ def build_dataset_rank(
 
         if test_split_ratio > 0 and len(ds) > 1:
             splits = ds.train_test_split(test_size=test_split_ratio, seed=seed)
-            ds1 = splits["test"] if get_test_subset else splits["train"]
+            # ds1 = splits["test"] if get_test_subset else splits["train"]
+            ds1 = splits["test"]
             print(
                 f"dataset rank: returning {'TEST' if get_test_subset else 'TRAIN'} split ({len(ds1)} examples)"
             )
@@ -525,6 +526,7 @@ class DataCollatorWithPaddingV2:
         # ---- allocate batch tensors (more efficient than per-item pad+cat)
         dtype_ids = input_ids_list[0].dtype  # usually torch.long
         batch_input_ids = torch.full((B, max_length), self.pad_token_id, dtype=dtype_ids, device=device)
+        batch_position_ids = torch.zeros((B, max_length), dtype=dtype_ids, device=device)
         batch_attention_mask = torch.zeros((B, max_length), dtype=torch.bool, device=device)
         batch_attention_bias = torch.empty((B, 1, max_length, max_length), dtype=torch.float32, device=device)
         batch_loss_mask = torch.zeros((B, max_length), dtype=torch.long, device=device)  # usually bool/long
@@ -546,7 +548,7 @@ class DataCollatorWithPaddingV2:
 
             prefix = tgt[:s]  # [s]
             window = tgt[s:s + self.total_length]  # [length] (or shorter if tgt too short)
-
+                        
             # if tgt is shorter than length, pad window (rare if your data is valid)
             window_size = window.size(0)
             if window_size < self.total_length:
@@ -558,12 +560,21 @@ class DataCollatorWithPaddingV2:
             seq = torch.cat([inp, prefix.to(dtype_ids), window[:-self.block_size], mask_tokens[:window_size]], dim=0)  # [seq_len]
             L = seq.size(0)
 
+            prefix_end = inp.shape[0] + prefix.shape[0]
+            prefix_pos = torch.arange(0, prefix_end)
+            window_pos = torch.arange(prefix_end, prefix_end + window_size-self.block_size)
+            masked_pos = torch.arange(prefix_end, prefix_end + window_size)
+            pos = torch.cat([prefix_pos, window_pos, masked_pos], dim=0)  # [seq_len]
+            assert pos.shape[0] == L, "mismatch length in position_ids and input_ids"
+            
             batch_input_ids[i, :L] = seq
+            batch_position_ids[i, :L] = pos
+            
             batch_attention_mask[i, :L] = 1
             allow = build_block_attention_mask(
                 max_length=max_length,
                 inp_len=inp.shape[0],
-                prefix_len=prefix_len,
+                prefix_len=s,
                 window_len=window[:-self.block_size].shape[0],
                 mask_len=mask_tokens[:window_size].shape[0],
                 block_size=self.block_size,
@@ -585,6 +596,7 @@ class DataCollatorWithPaddingV2:
 
         return {
             "input_ids": batch_input_ids,
+            "position_ids": batch_position_ids,
             "target": batch_target,                 # [B, length]
             "attention_mask": batch_attention_mask, # [B, max_length]
             "attention_bias": batch_attention_bias, # [B, :, max_length, max_length]

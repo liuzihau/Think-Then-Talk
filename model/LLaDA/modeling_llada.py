@@ -408,24 +408,39 @@ class RotaryEmbedding(nn.Module):
     def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         return ((t * pos_cos) + (self.rotate_half(t) * pos_sin)).to(t.dtype)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, q: torch.Tensor, k: torch.Tensor, position_ids: Optional[torch.LongTensor]= None) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.config.rope_full_precision:
             q_, k_ = q.float(), k.float()
         else:
             q_, k_ = q, k
-
-        with torch.autocast(q.device.type, enabled=False):
-            query_len, key_len = q_.shape[-2], k_.shape[-2]  # could be different if layer_past not None
-            pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
-            pos_sin = pos_sin.type_as(q_)
-            pos_cos = pos_cos.type_as(q_)
-            q_ = self.apply_rotary_pos_emb(
-                pos_sin[:, :, key_len - query_len : key_len, :],
-                pos_cos[:, :, key_len - query_len : key_len, :],
-                q_,
-            )
-            k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
-        return q_.type_as(q), k_.type_as(k)
+        if position_ids is None:
+            with torch.autocast(q.device.type, enabled=False):
+                query_len, key_len = q_.shape[-2], k_.shape[-2]  # could be different if layer_past not None
+                pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
+                pos_sin = pos_sin.type_as(q_)
+                pos_cos = pos_cos.type_as(q_)
+                q_ = self.apply_rotary_pos_emb(
+                    pos_sin[:, :, key_len - query_len : key_len, :],
+                    pos_cos[:, :, key_len - query_len : key_len, :],
+                    q_,
+                )
+                k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
+            return q_.type_as(q), k_.type_as(k)
+        else:
+            with torch.autocast(q.device.type, enabled=False):
+                max_pos = position_ids.max().item() + 1
+                pos_sin, pos_cos = self.get_rotary_embedding(max_pos, q_.device)  #[B, max_ids]
+                sin_table = pos_sin.squeeze(0).squeeze(0)
+                cos_table = pos_cos.squeeze(0).squeeze(0)
+                _sin = sin_table[position_ids]
+                _cos = cos_table[position_ids]
+                _sin = _sin.unsqueeze(1)
+                _cos = _cos.unsqueeze(1)
+                _sin = _sin.type_as(q_)
+                _cos = _cos.type_as(q_)
+                q_ = self.apply_rotary_pos_emb(_sin, _cos, q_)
+                k_ = self.apply_rotary_pos_emb(_sin, _cos, k_)
+            return q_.type_as(q), k_.type_as(k)
 
 
 class Activation(nn.Module):
@@ -667,6 +682,7 @@ class LLaDABlock(nn.Module):
         attention_bias: Optional[torch.Tensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        position_ids: Optional[torch.LongTensor]= None
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = q.size()  # batch size, sequence length, d_model
         dtype = k.dtype
@@ -684,6 +700,10 @@ class LLaDABlock(nn.Module):
         # shape: (B, n_kv_h, T, hs)
         v = v.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
 
+        if self.config.rope:
+            # Apply rotary embeddings.
+            q, k = self.rotary_emb(q, k, position_ids)
+
         if layer_past is not None:
             past_key, past_value = layer_past
             k = torch.cat((past_key, k), dim=-2)
@@ -691,10 +711,6 @@ class LLaDABlock(nn.Module):
 
         present = (k, v) if use_cache else None
         query_len, key_len = q.shape[-2], k.shape[-2]  # could be different if layer_past not None
-
-        if self.config.rope:
-            # Apply rotary embeddings.
-            q, k = self.rotary_emb(q, k)
 
         if attention_bias is not None:
             # Resize and cast attention bias.
@@ -728,6 +744,7 @@ class LLaDABlock(nn.Module):
         self,
         x: torch.Tensor,
         attention_bias: Optional[torch.FloatTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
@@ -887,6 +904,7 @@ class LLaDALlamaBlock(LLaDABlock):
         self,
         x: torch.Tensor,
         attention_bias: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
@@ -905,10 +923,10 @@ class LLaDALlamaBlock(LLaDABlock):
         # Get attention scores.
         if self._activation_checkpoint_fn is not None:
             att, cache = self._activation_checkpoint_fn(  # type: ignore
-                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache
+                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids
             )
         else:
-            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache)
+            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -978,6 +996,7 @@ class LLaDABlockGroup(nn.ModuleList):
         x: torch.Tensor,
         attention_bias: Optional[torch.FloatTensor] = None,
         layers_past: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
@@ -1001,11 +1020,11 @@ class LLaDABlockGroup(nn.ModuleList):
             ):
                 # shape: (batch_size, seq_len, d_model)
                 x, cache = self._activation_checkpoint_fn(  # type: ignore
-                    block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
+                    block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids
                 )
             else:
                 # shape: (batch_size, seq_len, d_model)
-                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache)
+                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids)
             if attn_key_values is not None:
                 assert cache is not None
                 attn_key_values.append(cache)
@@ -1179,6 +1198,7 @@ class LLaDAModel(nn.Module):
         input_embeddings: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
         last_logits_only: bool = False,
@@ -1344,11 +1364,11 @@ class LLaDAModel(nn.Module):
                     ):
                         # shape: (batch_size, seq_len, d_model)
                         x, cache = self._activation_checkpoint_fn(
-                            block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
+                            block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids
                         )
                     else:
                         # shape: (batch_size, seq_len, d_model)
-                        x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache)
+                        x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids)
                     if attn_key_values is not None:
                         assert cache is not None
                         ck, cv = cache
@@ -1471,6 +1491,7 @@ class LLaDAModelLM(PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -1493,6 +1514,7 @@ class LLaDAModelLM(PreTrainedModel):
             input_embeddings=inputs_embeds,
             attention_mask=attention_mask,
             attention_bias=attention_bias,
+            position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,

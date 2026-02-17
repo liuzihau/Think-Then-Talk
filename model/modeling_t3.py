@@ -1060,6 +1060,7 @@ class T3Model(nn.Module):
                 input_embeddings=inputs_embeds,
                 attention_mask=attention_mask,
                 attention_bias=attention_bias,
+                position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 last_logits_only=last_logits_only,

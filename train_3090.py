@@ -332,8 +332,10 @@ def main():
     SEED = 0
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trainpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset,allenai/tulu-3-sft-mixture")
-    parser.add_argument("--testpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset,allenai/tulu-3-sft-mixture")
+    # parser.add_argument("--trainpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset,allenai/tulu-3-sft-mixture")
+    # parser.add_argument("--testpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset,allenai/tulu-3-sft-mixture")
+    parser.add_argument("--trainpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset")
+    parser.add_argument("--testpath", type=str, default="nvidia/Llama-Nemotron-Post-Training-Dataset")
     parser.add_argument("--split", type=str, default="chat,train")
     parser.add_argument("--savedir", type=str, default="0")
     parser.add_argument("--training_config", type=str, default="train/train_config.json")
@@ -503,9 +505,11 @@ def main():
 
             # Thought inputs on THINK_DEVICE
             input_ids_think = data["input_ids"].to(THINK_DEVICE1, non_blocking=True)
+            pos_ids_think = data["position_ids"].to(THINK_DEVICE1, non_blocking=True)
             attn_think      = data["attention_mask"].to(THINK_DEVICE1, non_blocking=True)
             bias_think      = data["attention_bias"].to(THINK_DEVICE1, non_blocking=True)
-
+            # for it in input_ids_think:
+            #     print(tokenizer.decode(it.detach().view(-1).tolist()))
             # -----------------
             # Think forward
             # -----------------
@@ -513,6 +517,7 @@ def main():
             with ctx:
                 think_outputs = model(
                     input_ids=input_ids_think,
+                    position_ids=pos_ids_think,
                     attention_mask=attn_think,
                     attention_bias=bias_think,
                     use_cache=False,
