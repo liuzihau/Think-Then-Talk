@@ -41,8 +41,8 @@
         "params": {
             "warmup_min_lr": 0,
             "warmup_max_lr": 3e-5,
-            "warmup_num_steps": 7200,
-            "total_num_steps": 900000
+            "warmup_num_steps": 900,
+            "total_num_steps": 90000
         }
     },
     "zero_optimization": {
@@ -63,7 +63,7 @@
     "training_parameters": {
         "wandb_name": "cfg5",
         "bs": 4,
-        "num_epochs": 40,
+        "num_epochs": 10,
         "num_workers": 2,
         "max_len": 4096,
         "config_path": "model/talk_ml_config.json",
