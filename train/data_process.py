@@ -496,7 +496,7 @@ class DataCollatorWithPaddingV2:
                 device=device
         )  # [B], clamp to >=1 to avoid errors if Ti < length
         end_max_starts = torch.tensor(
-                [max(t.size(0) - self.block_size * self.block_num // 2 + 1, 1)for t in target_list],
+                [max(t.size(0) - (self.block_size * self.block_num * 3) // 4 + 1, 1)for t in target_list],
                 device=device
         )
 

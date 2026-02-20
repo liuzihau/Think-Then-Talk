@@ -367,7 +367,8 @@ def main():
     # copy model related parameter from train_config
     model_config["train_dataset"] = train_config["data"]["train_dataset"]
     model_config["length"] = train_config["data"]["block_size"]
-    model_config["prune_last_n_layer"] = train_config["prune_last_n_layer"]
+    model_config["prune_last_n_layer"] = train_config["talk_model"]["prune_last_n_layer"]
+    model_config["talk_model"]["n_layers"] = train_config["talk_model"]["n_layers"]
     model_config["mix_indexes"] = train_config["mix_indexes"]
     model_config["denoise"] = train_config["denoise"]
     if train_config["lora"]["enabled"]:
@@ -454,6 +455,8 @@ def main():
     )
     
     grad_accum = int(train_config.get("gradient_accumulation_steps", 1))
+    grad_clip = float(train_config.get("gradient_clipping", 0.0) or 0.0)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     
     def lr_lambda(step: int):
         if step < warmup_steps:
@@ -602,16 +605,27 @@ def main():
                     
                     # denoise step updates input_ids + loss_mask (both on TALK_DEVICE)
                     if train_config["soft_inputs"]["enabled"]:
-                        input_ids, input_embeds, loss_mask = denoise_k_step_soft_embed_v2(
-                                input_ids=input_ids,
-                                target=target_talk,
-                                loss_mask=loss_mask,
-                                logits=logits,
-                                emb_weight=model.talk_embed_weight,
-                                soft_topk=train_config["soft_inputs"]["top_k"],
-                                soft_temp=train_config["soft_inputs"]["temperature"],
-                                mode=train_config["denoise"]["reveal_strategy"]
-                            )
+                        soft_cfg = train_config["soft_inputs"]
+                        kwargs = dict(
+                            input_ids=input_ids,
+                            target=target_talk,
+                            loss_mask=loss_mask,
+                            logits=logits,
+                            emb_weight=model.talk_embed_weight,
+                            soft_topk=soft_cfg["top_k"],
+                            soft_temp=soft_cfg["temperature"],
+                            mode=train_config["denoise"]["reveal_strategy"],
+                        )
+                        # Only enable mask-mix when user explicitly sets lam_max/lam_min in config
+                        if ("lam_max" in soft_cfg) or ("lam_min" in soft_cfg):
+                            kwargs["lam_max"] = float(soft_cfg.get("lam_max", 0.7))  # sensible default once enabled
+                            kwargs["lam_min"] = float(soft_cfg.get("lam_min", 0.0))
+                            # also recommend passing mask_token_id explicitly when enabled
+                            mid = getattr(tokenizer, "mask_token_id", None)
+                            if mid is not None:
+                                kwargs["mask_token_id"] = mid
+                                
+                        input_ids, input_embeds, loss_mask = denoise_k_step_soft_embed_v2(**kwargs)
                     else:
                         input_ids, loss_mask = denoise_k_step(input_ids, target_talk, loss_mask)
                         input_embeds = F.embedding(input_ids, model.talk_embed_weight)  # initial emb (step 0)
@@ -648,6 +662,8 @@ def main():
                     loss.backward()
                     
                     if (batch_idx + 1) % grad_accum == 0:
+                        if grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
                         optimizer.step()
                         scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
