@@ -61,7 +61,7 @@
     "train_micro_batch_size_per_gpu": 1,
     "wall_clock_breakdown": false,
     "training_parameters": {
-        "wandb_name": "cfg5",
+        "wandb_name": "1token-4layers",
         "bs": 4,
         "num_epochs": 10,
         "num_workers": 2,
