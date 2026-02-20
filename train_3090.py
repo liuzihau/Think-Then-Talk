@@ -162,6 +162,65 @@ def calculate_correct_counts(logits, target, loss_mask):
     correct = (pred == target) & loss_mask.bool()
     return correct.sum().item(), loss_mask.sum().item()
 
+def pick_single_position(loss_mask: torch.Tensor, logits: torch.Tensor | None, mode: str):
+    """
+    Pick exactly one active position per row.
+    Returns:
+      cols: [BG] selected column index per row
+      valid: [BG] bool, whether that row has at least one active position
+    """
+    device = loss_mask.device
+    BG, L = loss_mask.shape
+    active = loss_mask.bool()
+
+    if mode == "ar_force":
+        pos = torch.arange(L, device=device).unsqueeze(0).expand(BG, L)
+        scores = (-pos).to(torch.float32)
+    elif mode == "random":
+        scores = torch.rand((BG, L), device=device)
+    elif mode == "greedy":
+        if logits is None:
+            raise ValueError("mode='greedy' requires logits")
+        scores = logits.max(dim=-1).values
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    scores = scores.masked_fill(~active, float("-inf"))
+    cols = scores.argmax(dim=1)
+    valid = active.any(dim=1)
+    return cols, valid
+
+def selected_position_loss_acc(
+    logits: torch.Tensor,      # [BG, L, V]
+    target: torch.Tensor,      # [BG, L]
+    cols: torch.Tensor,        # [BG]
+    valid: torch.Tensor,       # [BG] bool
+):
+    """
+    Compute token NLL and accuracy at selected positions only.
+    """
+    if not valid.any():
+        return 0.0, 0.0
+
+    BG = logits.size(0)
+    rows = torch.arange(BG, device=logits.device)
+
+    sel_target = target[rows, cols].long()
+    sel_pred = logits.argmax(dim=-1)[rows, cols]
+    sel_logp = F.log_softmax(logits, dim=-1)[rows, cols, sel_target]
+
+    sel_acc = (sel_pred == sel_target).float()[valid]
+    sel_loss = (-sel_logp)[valid]
+
+    return float(sel_loss.mean().item()), float(sel_acc.mean().item())
+
+def append_jsonl(path: str, payload: dict):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
 
 def find_max_state_with_file(directory, filename="ckpt.pt"):
     """
@@ -351,6 +410,8 @@ def main():
     VIS_EVERY_OPT_STEP = 2000     # optimiser steps
     VIS_MAX_STEPS = 16            # denoise steps to print (avoid huge logs)
     VIS_BIDX = 0                  # which sample in batch
+    STEP_METRIC_LOG = "logs/train_step_metrics.jsonl"
+    EPOCH_METRIC_LOG = "logs/epoch_metrics.jsonl"
 
     torch.backends.cuda.matmul.allow_tf32 = True
     set_seed(SEED)
@@ -499,9 +560,17 @@ def main():
 
         epoch_acces = [[] for _ in range(model.length)]
         epoch_plosses = [[] for _ in range(model.length)]
+        epoch_certain_losses = [[] for _ in range(model.length)]
+        epoch_certain_accs = [[] for _ in range(model.length)]
+        epoch_decode_losses = [[] for _ in range(model.length)]
+        epoch_decode_accs = [[] for _ in range(model.length)]
 
         batch_acces = [[] for _ in range(model.length)]
         batch_plosses = [[] for _ in range(model.length)]
+        batch_certain_losses = [[] for _ in range(model.length)]
+        batch_certain_accs = [[] for _ in range(model.length)]
+        batch_decode_losses = [[] for _ in range(model.length)]
+        batch_decode_accs = [[] for _ in range(model.length)]
         
         pbar = tqdm(loader, desc=("train" if train else "test"))
         for batch_idx, data in enumerate(pbar):
@@ -535,6 +604,10 @@ def main():
             loss_sums = []
             counts = []
             acces = []
+            certain_losses = []
+            certain_accs = []
+            decode_losses = []
+            decode_accs = []
 
             # -----------------
             # Talking iterations
@@ -593,11 +666,37 @@ def main():
                     )
 
                     correct, total = calculate_correct_counts(logits, target_talk, loss_mask)
+                    certain_cols, certain_valid = pick_single_position(
+                        loss_mask=loss_mask,
+                        logits=logits,
+                        mode="greedy",
+                    )
+                    certain_loss_i, certain_acc_i = selected_position_loss_acc(
+                        logits=logits,
+                        target=target_talk,
+                        cols=certain_cols,
+                        valid=certain_valid,
+                    )
+                    decode_cols, decode_valid = pick_single_position(
+                        loss_mask=loss_mask,
+                        logits=logits,
+                        mode=train_config["denoise"]["reveal_strategy"],
+                    )
+                    decode_loss_i, decode_acc_i = selected_position_loss_acc(
+                        logits=logits,
+                        target=target_talk,
+                        cols=decode_cols,
+                        valid=decode_valid,
+                    )
 
                     # plosses.append(loss_i)
                     loss_sums.append(loss_sum_i)
                     counts.append(count_i)
                     acces.append(correct / max(1, total))
+                    certain_losses.append(certain_loss_i)
+                    certain_accs.append(certain_acc_i)
+                    decode_losses.append(decode_loss_i)
+                    decode_accs.append(decode_acc_i)
                     
                     if do_vis and idx < VIS_MAX_STEPS:
                         steps_pred_BG_L.append(logits.argmax(dim=-1).detach())  # [B*G, L]
@@ -676,16 +775,34 @@ def main():
             #     batch_plosses[i].append(plosses[i].detach().item())
             for i in range(len(loss_sums)):
                 batch_plosses[i].append(loss_sums[i].detach().item() / counts[i].detach().item())
+            for i in range(len(certain_losses)):
+                batch_certain_losses[i].append(certain_losses[i])
+                batch_certain_accs[i].append(certain_accs[i])
+                batch_decode_losses[i].append(decode_losses[i])
+                batch_decode_accs[i].append(decode_accs[i])
 
             if (batch_idx + 1) % grad_accum == 0:
                 batch_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_acces]
                 batch_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_plosses]
+                batch_certain_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_certain_losses]
+                batch_certain_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_certain_accs]
+                batch_decode_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_decode_losses]
+                batch_decode_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_decode_accs]
                 for i in range(len(batch_acc_mean)):
                     epoch_acces[i].append(batch_acc_mean[i])
                 for i in range(len(batch_loss_mean)):
                     epoch_plosses[i].append(batch_loss_mean[i])
+                for i in range(len(batch_certain_loss_mean)):
+                    epoch_certain_losses[i].append(batch_certain_loss_mean[i])
+                    epoch_certain_accs[i].append(batch_certain_acc_mean[i])
+                    epoch_decode_losses[i].append(batch_decode_loss_mean[i])
+                    epoch_decode_accs[i].append(batch_decode_acc_mean[i])
                 batch_acces = [[] for _ in range(model.length)]
                 batch_plosses = [[] for _ in range(model.length)]
+                batch_certain_losses = [[] for _ in range(model.length)]
+                batch_certain_accs = [[] for _ in range(model.length)]
+                batch_decode_losses = [[] for _ in range(model.length)]
+                batch_decode_accs = [[] for _ in range(model.length)]
                 
                 # wandb step logs
                 if use_wandb and train:
@@ -694,7 +811,37 @@ def main():
                         logdict[f"train/ploss_{i:02d}"] = float(v)
                     for i, a in enumerate(batch_acc_mean):
                         logdict[f"train/acc_{i:02d}"] = float(a)
+                    for i, v in enumerate(batch_certain_loss_mean):
+                        logdict[f"train/certain_loss_{i:02d}"] = float(v)
+                    for i, a in enumerate(batch_certain_acc_mean):
+                        logdict[f"train/certain_acc_{i:02d}"] = float(a)
+                    for i, v in enumerate(batch_decode_loss_mean):
+                        logdict[f"train/decode_loss_{i:02d}"] = float(v)
+                    for i, a in enumerate(batch_decode_acc_mean):
+                        logdict[f"train/decode_acc_{i:02d}"] = float(a)
                     wandb.log(logdict)
+                if train:
+                    append_jsonl(
+                        STEP_METRIC_LOG,
+                        {
+                            "epoch": int(epoch_num),
+                            "global_step": int(global_step),
+                            "lr": float(optimizer.param_groups[0]["lr"]),
+                            "loss_by_iter": batch_loss_mean,
+                            "acc_by_iter": batch_acc_mean,
+                            "certain_loss_by_iter": batch_certain_loss_mean,
+                            "certain_acc_by_iter": batch_certain_acc_mean,
+                            "decode_loss_by_iter": batch_decode_loss_mean,
+                            "decode_acc_by_iter": batch_decode_acc_mean,
+                            "loss_mean": float(np.mean(batch_loss_mean)),
+                            "acc_mean": float(np.mean(batch_acc_mean)),
+                            "certain_loss_mean": float(np.mean(batch_certain_loss_mean)),
+                            "certain_acc_mean": float(np.mean(batch_certain_acc_mean)),
+                            "decode_loss_mean": float(np.mean(batch_decode_loss_mean)),
+                            "decode_acc_mean": float(np.mean(batch_decode_acc_mean)),
+                            "decode_mode": str(train_config["denoise"]["reveal_strategy"]),
+                        },
+                    )
                 
 
             if do_vis:
@@ -718,7 +865,18 @@ def main():
         # epoch summary
         epoch_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in epoch_acces]
         epoch_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in epoch_plosses]
-        return epoch_acc_mean, epoch_loss_mean
+        epoch_certain_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in epoch_certain_losses]
+        epoch_certain_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in epoch_certain_accs]
+        epoch_decode_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in epoch_decode_losses]
+        epoch_decode_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in epoch_decode_accs]
+        return {
+            "acc_by_iter": epoch_acc_mean,
+            "loss_by_iter": epoch_loss_mean,
+            "certain_loss_by_iter": epoch_certain_loss_mean,
+            "certain_acc_by_iter": epoch_certain_acc_mean,
+            "decode_loss_by_iter": epoch_decode_loss_mean,
+            "decode_acc_by_iter": epoch_decode_acc_mean,
+        }
 
     # -------------------------
     # Main epoch loop
@@ -727,24 +885,65 @@ def main():
         print(f"\n===== Epoch {epoch+1}/{num_epochs} =====")
 
         # Train
-        train_acc, train_loss = run_epoch(train_loader, train=True, finetune=True, epoch_num=epoch)
+        train_stats = run_epoch(train_loader, train=True, finetune=True, epoch_num=epoch)
 
         print("Train:")
-        for i in range(len(train_acc)):
+        for i in range(len(train_stats["acc_by_iter"])):
             if use_wandb:
                 import wandb
-                wandb.log({f"train/epochacc_{i:02d}": train_acc[i], f"train/epochploss_{i:02d}": train_loss[i]})
-            print(f"  iter {i}: Acc {train_acc[i]*100:5.2f}% | pLoss {train_loss[i]:.6f}")
+                wandb.log(
+                    {
+                        f"train/epochacc_{i:02d}": train_stats["acc_by_iter"][i],
+                        f"train/epochploss_{i:02d}": train_stats["loss_by_iter"][i],
+                        f"train/epoch_certain_loss_{i:02d}": train_stats["certain_loss_by_iter"][i],
+                        f"train/epoch_certain_acc_{i:02d}": train_stats["certain_acc_by_iter"][i],
+                        f"train/epoch_decode_loss_{i:02d}": train_stats["decode_loss_by_iter"][i],
+                        f"train/epoch_decode_acc_{i:02d}": train_stats["decode_acc_by_iter"][i],
+                    }
+                )
+            print(
+                f"  iter {i}: Acc {train_stats['acc_by_iter'][i]*100:5.2f}% | "
+                f"pLoss {train_stats['loss_by_iter'][i]:.6f} | "
+                f"certain Acc {train_stats['certain_acc_by_iter'][i]*100:5.2f}% | "
+                f"certain Loss {train_stats['certain_loss_by_iter'][i]:.6f} | "
+                f"decode Acc {train_stats['decode_acc_by_iter'][i]*100:5.2f}% | "
+                f"decode Loss {train_stats['decode_loss_by_iter'][i]:.6f}"
+            )
 
         # Test
-        test_acc, test_loss = run_epoch(test_loader, train=False, finetune=False, epoch_num=epoch)
+        test_stats = run_epoch(test_loader, train=False, finetune=False, epoch_num=epoch)
 
         print("Test:")
-        for i in range(len(test_acc)):
+        for i in range(len(test_stats["acc_by_iter"])):
             if use_wandb:
                 import wandb
-                wandb.log({f"test/epochacc_{i:02d}": test_acc[i], f"test/epochploss_{i:02d}": test_loss[i]})
-            print(f"  iter {i}: Acc {test_acc[i]*100:5.2f}% | pLoss {test_loss[i]:.6f}")
+                wandb.log(
+                    {
+                        f"test/epochacc_{i:02d}": test_stats["acc_by_iter"][i],
+                        f"test/epochploss_{i:02d}": test_stats["loss_by_iter"][i],
+                        f"test/epoch_certain_loss_{i:02d}": test_stats["certain_loss_by_iter"][i],
+                        f"test/epoch_certain_acc_{i:02d}": test_stats["certain_acc_by_iter"][i],
+                        f"test/epoch_decode_loss_{i:02d}": test_stats["decode_loss_by_iter"][i],
+                        f"test/epoch_decode_acc_{i:02d}": test_stats["decode_acc_by_iter"][i],
+                    }
+                )
+            print(
+                f"  iter {i}: Acc {test_stats['acc_by_iter'][i]*100:5.2f}% | "
+                f"pLoss {test_stats['loss_by_iter'][i]:.6f} | "
+                f"certain Acc {test_stats['certain_acc_by_iter'][i]*100:5.2f}% | "
+                f"certain Loss {test_stats['certain_loss_by_iter'][i]:.6f} | "
+                f"decode Acc {test_stats['decode_acc_by_iter'][i]*100:5.2f}% | "
+                f"decode Loss {test_stats['decode_loss_by_iter'][i]:.6f}"
+            )
+        append_jsonl(
+            EPOCH_METRIC_LOG,
+            {
+                "epoch": int(epoch),
+                "train": train_stats,
+                "test": test_stats,
+                "decode_mode": str(train_config["denoise"]["reveal_strategy"]),
+            },
+        )
 
         # clear cache
         torch.cuda.empty_cache()
