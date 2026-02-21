@@ -120,7 +120,9 @@
         "enabled": true,
         "type": "gated",
         "eta": 0.2,
-        "norm": "rmsnorm"
+        "norm": "rmsnorm",
+        "source_layer": 0,
+        "use_mlp": true
     },
     "soft_inputs": {
         "enabled": true,

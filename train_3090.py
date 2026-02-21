@@ -564,6 +564,9 @@ def main():
         epoch_certain_accs = [[] for _ in range(model.length)]
         epoch_decode_losses = [[] for _ in range(model.length)]
         epoch_decode_accs = [[] for _ in range(model.length)]
+        epoch_clip_flags = []
+        epoch_grad_norm_pre = []
+        epoch_grad_norm_post = []
 
         batch_acces = [[] for _ in range(model.length)]
         batch_plosses = [[] for _ in range(model.length)]
@@ -571,6 +574,9 @@ def main():
         batch_certain_accs = [[] for _ in range(model.length)]
         batch_decode_losses = [[] for _ in range(model.length)]
         batch_decode_accs = [[] for _ in range(model.length)]
+        batch_clip_flags = []
+        batch_grad_norm_pre = []
+        batch_grad_norm_post = []
         
         pbar = tqdm(loader, desc=("train" if train else "test"))
         for batch_idx, data in enumerate(pbar):
@@ -761,12 +767,21 @@ def main():
                     loss.backward()
                     
                     if (batch_idx + 1) % grad_accum == 0:
+                        clip_flag = 0.0
+                        pre_norm = 0.0
+                        post_norm = 0.0
                         if grad_clip > 0:
-                            torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+                            total_norm = torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+                            pre_norm = float(total_norm.item() if torch.is_tensor(total_norm) else total_norm)
+                            post_norm = float(min(pre_norm, grad_clip))
+                            clip_flag = 1.0 if pre_norm > grad_clip else 0.0
                         optimizer.step()
                         scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
                         global_step += 1
+                        batch_clip_flags.append(clip_flag)
+                        batch_grad_norm_pre.append(pre_norm)
+                        batch_grad_norm_post.append(post_norm)
 
             # record batch stats (move scalar to cpu)
             for i in range(len(acces)):
@@ -788,6 +803,9 @@ def main():
                 batch_certain_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_certain_accs]
                 batch_decode_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_decode_losses]
                 batch_decode_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_decode_accs]
+                batch_clip_rate = float(np.mean(batch_clip_flags)) if len(batch_clip_flags) else 0.0
+                batch_grad_pre_mean = float(np.mean(batch_grad_norm_pre)) if len(batch_grad_norm_pre) else 0.0
+                batch_grad_post_mean = float(np.mean(batch_grad_norm_post)) if len(batch_grad_norm_post) else 0.0
                 for i in range(len(batch_acc_mean)):
                     epoch_acces[i].append(batch_acc_mean[i])
                 for i in range(len(batch_loss_mean)):
@@ -797,16 +815,28 @@ def main():
                     epoch_certain_accs[i].append(batch_certain_acc_mean[i])
                     epoch_decode_losses[i].append(batch_decode_loss_mean[i])
                     epoch_decode_accs[i].append(batch_decode_acc_mean[i])
+                if len(batch_clip_flags):
+                    epoch_clip_flags.extend(batch_clip_flags)
+                    epoch_grad_norm_pre.extend(batch_grad_norm_pre)
+                    epoch_grad_norm_post.extend(batch_grad_norm_post)
                 batch_acces = [[] for _ in range(model.length)]
                 batch_plosses = [[] for _ in range(model.length)]
                 batch_certain_losses = [[] for _ in range(model.length)]
                 batch_certain_accs = [[] for _ in range(model.length)]
                 batch_decode_losses = [[] for _ in range(model.length)]
                 batch_decode_accs = [[] for _ in range(model.length)]
+                batch_clip_flags = []
+                batch_grad_norm_pre = []
+                batch_grad_norm_post = []
                 
                 # wandb step logs
                 if use_wandb and train:
-                    logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
+                    logdict = {
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/clip_rate": batch_clip_rate,
+                        "train/grad_norm_preclip": batch_grad_pre_mean,
+                        "train/grad_norm_postclip": batch_grad_post_mean,
+                    }
                     for i, v in enumerate(batch_loss_mean):
                         logdict[f"train/ploss_{i:02d}"] = float(v)
                     for i, a in enumerate(batch_acc_mean):
@@ -839,6 +869,9 @@ def main():
                             "certain_acc_mean": float(np.mean(batch_certain_acc_mean)),
                             "decode_loss_mean": float(np.mean(batch_decode_loss_mean)),
                             "decode_acc_mean": float(np.mean(batch_decode_acc_mean)),
+                            "clip_rate": batch_clip_rate,
+                            "grad_norm_preclip": batch_grad_pre_mean,
+                            "grad_norm_postclip": batch_grad_post_mean,
                             "decode_mode": str(train_config["denoise"]["reveal_strategy"]),
                         },
                     )
@@ -869,6 +902,9 @@ def main():
         epoch_certain_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in epoch_certain_accs]
         epoch_decode_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in epoch_decode_losses]
         epoch_decode_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in epoch_decode_accs]
+        epoch_clip_rate = float(np.mean(epoch_clip_flags)) if len(epoch_clip_flags) else 0.0
+        epoch_grad_pre_mean = float(np.mean(epoch_grad_norm_pre)) if len(epoch_grad_norm_pre) else 0.0
+        epoch_grad_post_mean = float(np.mean(epoch_grad_norm_post)) if len(epoch_grad_norm_post) else 0.0
         return {
             "acc_by_iter": epoch_acc_mean,
             "loss_by_iter": epoch_loss_mean,
@@ -876,6 +912,9 @@ def main():
             "certain_acc_by_iter": epoch_certain_acc_mean,
             "decode_loss_by_iter": epoch_decode_loss_mean,
             "decode_acc_by_iter": epoch_decode_acc_mean,
+            "clip_rate": epoch_clip_rate,
+            "grad_norm_preclip": epoch_grad_pre_mean,
+            "grad_norm_postclip": epoch_grad_post_mean,
         }
 
     # -------------------------
@@ -888,6 +927,20 @@ def main():
         train_stats = run_epoch(train_loader, train=True, finetune=True, epoch_num=epoch)
 
         print("Train:")
+        if use_wandb:
+            import wandb
+            wandb.log(
+                {
+                    "train/epoch_clip_rate": train_stats["clip_rate"],
+                    "train/epoch_grad_norm_preclip": train_stats["grad_norm_preclip"],
+                    "train/epoch_grad_norm_postclip": train_stats["grad_norm_postclip"],
+                }
+            )
+        print(
+            f"  clip: rate {train_stats['clip_rate']*100:5.2f}% | "
+            f"grad pre {train_stats['grad_norm_preclip']:.4f} | "
+            f"grad post {train_stats['grad_norm_postclip']:.4f}"
+        )
         for i in range(len(train_stats["acc_by_iter"])):
             if use_wandb:
                 import wandb
@@ -914,6 +967,20 @@ def main():
         test_stats = run_epoch(test_loader, train=False, finetune=False, epoch_num=epoch)
 
         print("Test:")
+        if use_wandb:
+            import wandb
+            wandb.log(
+                {
+                    "test/epoch_clip_rate": test_stats["clip_rate"],
+                    "test/epoch_grad_norm_preclip": test_stats["grad_norm_preclip"],
+                    "test/epoch_grad_norm_postclip": test_stats["grad_norm_postclip"],
+                }
+            )
+        print(
+            f"  clip: rate {test_stats['clip_rate']*100:5.2f}% | "
+            f"grad pre {test_stats['grad_norm_preclip']:.4f} | "
+            f"grad post {test_stats['grad_norm_postclip']:.4f}"
+        )
         for i in range(len(test_stats["acc_by_iter"])):
             if use_wandb:
                 import wandb
