@@ -4,3 +4,5 @@
 *hf*
 *wandb*
 *.pyc
+legacy*
+*cfg*

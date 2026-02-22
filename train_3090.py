@@ -278,7 +278,7 @@ def resolve_state_dir(path: str | None, filename: str = "ckpt.pt"):
     return None
 
 
-def denoise_k_step(input_ids, target, loss_mask, k=1, generator=None):
+def denoise_k_step(input_ids, target, loss_mask, logits=None, k=1, mode="random", generator=None):
     """
     input_ids: [BG, L] on TALK_DEVICE
     target:    [BG, L] on TALK_DEVICE
@@ -288,14 +288,24 @@ def denoise_k_step(input_ids, target, loss_mask, k=1, generator=None):
     B, C = input_ids.shape
 
     active = loss_mask.bool()
-    if generator is not None:
-        assert generator.device == device
-        scores = torch.rand((B, C), device=device, generator=generator)
+    if mode == "ar_force":
+        pos = torch.arange(C, device=device).unsqueeze(0).expand(B, C)
+        scores = (-pos).to(torch.float32)
+    elif mode == "greedy":
+        if logits is None:
+            raise ValueError("mode='greedy' requires logits")
+        scores = logits.max(dim=-1).values
+    elif mode == "random":
+        if generator is not None:
+            assert generator.device == device
+            scores = torch.rand((B, C), device=device, generator=generator)
+        else:
+            scores = torch.rand((B, C), device=device)
     else:
-        scores = torch.rand((B, C), device=device)
+        raise ValueError(f"Unknown mode: {mode}")
     scores = scores.masked_fill(~active, float("-inf"))
 
-    idx = scores.topk(k=min(k, C), dim=1).indices  # [B, k]
+    idx = scores.topk(k=max(1, min(k, C)), dim=1).indices  # [B, k]
     chosen_active = active.gather(1, idx)          # [B, k]
 
     rows = torch.arange(B, device=device).unsqueeze(1).expand_as(idx)
@@ -761,6 +771,8 @@ def main():
                         steps_mask_BG_L.append(loss_mask.detach())             # [B*G, L]
                     
                     # denoise step updates input_ids + loss_mask (both on TALK_DEVICE)
+                    reveal_k = int(train_config["denoise"].get("reveal_k", 1))
+                    reveal_mode = str(train_config["denoise"].get("reveal_strategy", "random"))
                     if train_config["soft_inputs"]["enabled"]:
                         soft_cfg = train_config["soft_inputs"]
                         kwargs = dict(
@@ -769,9 +781,10 @@ def main():
                             loss_mask=loss_mask,
                             logits=logits,
                             emb_weight=model.talk_embed_weight,
+                            k_reveal=reveal_k,
                             soft_topk=soft_cfg["top_k"],
                             soft_temp=soft_cfg["temperature"],
-                            mode=train_config["denoise"]["reveal_strategy"],
+                            mode=reveal_mode,
                         )
                         # Only enable mask-mix when user explicitly sets lam_max/lam_min in config
                         if ("lam_max" in soft_cfg) or ("lam_min" in soft_cfg):
@@ -784,7 +797,14 @@ def main():
                                 
                         input_ids, input_embeds, loss_mask = denoise_k_step_soft_embed_v2(**kwargs)
                     else:
-                        input_ids, loss_mask = denoise_k_step(input_ids, target_talk, loss_mask)
+                        input_ids, loss_mask = denoise_k_step(
+                            input_ids=input_ids,
+                            target=target_talk,
+                            loss_mask=loss_mask,
+                            logits=logits,
+                            k=reveal_k,
+                            mode=reveal_mode,
+                        )
                         input_embeds = F.embedding(input_ids, model.talk_embed_weight)  # initial emb (step 0)
                     
                     if train_config["detach_recurrence"]["enabled"] and ((idx + 1) % train_config["detach_recurrence"]["every_r_steps"] == 0):
