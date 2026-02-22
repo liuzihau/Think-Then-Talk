@@ -46,12 +46,12 @@ def manual_init_talk_model(model, config):
         nn.init.normal_(model.fc.weight, std=init_std)
         if model.fc.bias is not None:
             nn.init.zeros_(model.fc.bias)
-    elif hasattr(model, "rps_mlp_in"):
+    if hasattr(model, "rps_mlp_in") and isinstance(model.rps_mlp_in, nn.Linear):
         print("Initializing rps_mlp_in ...")
         nn.init.normal_(model.rps_mlp_in.weight, std=init_std)
         if model.rps_mlp_in.bias is not None:
             nn.init.zeros_(model.rps_mlp_in.bias)
-    elif hasattr(model, "rps_mlp_out"):
+    if hasattr(model, "rps_mlp_out") and isinstance(model.rps_mlp_out, nn.Linear):
         print("Initializing rps_mlp_out ...")
         nn.init.normal_(model.rps_mlp_out.weight, std=init_std)
         if model.rps_mlp_out.bias is not None:

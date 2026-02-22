@@ -244,6 +244,39 @@ def find_max_state_with_file(directory, filename="ckpt.pt"):
         return None, 0
     return os.path.join(directory, f"state_{max_a}"), max_a + 1
 
+def resolve_state_dir(path: str | None, filename: str = "ckpt.pt"):
+    """
+    Resolve a checkpoint directory from user-provided path.
+    Accepts:
+      - a state dir that directly contains <filename>
+      - a run root directory that contains state_<N>/<filename> (picks max N)
+      - a direct path to <filename>
+    Returns state_dir or None.
+    """
+    if path is None:
+        return None
+    if not isinstance(path, str):
+        return None
+    path = os.path.expandvars(os.path.expanduser(path.strip()))
+    if not path:
+        return None
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+
+    if os.path.isfile(path):
+        if os.path.basename(path) == filename:
+            return os.path.dirname(path)
+        return None
+
+    if os.path.isdir(path):
+        direct_file = os.path.join(path, filename)
+        if os.path.isfile(direct_file):
+            return path
+        found_state_dir, _ = find_max_state_with_file(path, filename=filename)
+        return found_state_dir
+
+    return None
+
 
 def denoise_k_step(input_ids, target, loss_mask, k=1, generator=None):
     """
@@ -456,6 +489,7 @@ def main():
 
     # If no ckpt, init talking
     ckpt_dir, start_epoch = find_max_state_with_file(args.savedir, filename="ckpt.pt")
+    init_from_state_dir_cfg = train_config.get("init_from_state_dir", None)
 
     # -------------------------
     # Tokenizer / Data
@@ -530,6 +564,24 @@ def main():
     if ckpt_dir is not None:
         # load ckpt (map to CPU first; state_dict copy to correct device tensors is handled by optimizer load)
         start_epoch = load_ckpt(ckpt_dir, model, optimizer, scheduler, map_location="cpu")
+    else:
+        warm_start_dir = resolve_state_dir(init_from_state_dir_cfg, filename="ckpt.pt")
+        if warm_start_dir is not None:
+            # Warm-start only model weights, allowing missing/new keys.
+            _ = load_ckpt(
+                warm_start_dir,
+                model,
+                optimizer=None,
+                scheduler=None,
+                map_location="cpu",
+                strict_talk=False,
+            )
+            start_epoch = 0
+            print(f"[CKPT] warm-started talk/LoRA weights from: {warm_start_dir} (strict_talk=False)")
+        elif init_from_state_dir_cfg:
+            print(f"[CKPT] init_from_state_dir not found/invalid: {init_from_state_dir_cfg}; training from scratch.")
+        else:
+            print("[CKPT] no previous checkpoint found; training from scratch.")
 
     num_epochs = int(training_parameters["num_epochs"])
 
