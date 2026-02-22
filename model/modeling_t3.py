@@ -46,6 +46,16 @@ def manual_init_talk_model(model, config):
         nn.init.normal_(model.fc.weight, std=init_std)
         if model.fc.bias is not None:
             nn.init.zeros_(model.fc.bias)
+    elif hasattr(model, "rps_mlp_in"):
+        print("Initializing rps_mlp_in ...")
+        nn.init.normal_(model.rps_mlp_in.weight, std=init_std)
+        if model.rps_mlp_in.bias is not None:
+            nn.init.zeros_(model.rps_mlp_in.bias)
+    elif hasattr(model, "rps_mlp_out"):
+        print("Initializing rps_mlp_out ...")
+        nn.init.normal_(model.rps_mlp_out.weight, std=init_std)
+        if model.rps_mlp_out.bias is not None:
+            nn.init.zeros_(model.rps_mlp_out.bias)
 
     # Transformer blocks depth scaling
     blocks = model.transformer.blocks
@@ -507,7 +517,8 @@ class TalkModel(nn.Module):
         self.rps_norm = LayerNorm.build(config)  # same LN type as model uses
         self.rps_gate = nn.Linear(config.d_model, config.d_model)  # or to 1 for scalar gate
         self.rps_post_norm = LayerNorm.build(config)  # in __init__
-
+        self.rps_mlp_in = nn.Linear(config.d_model, config.d_model)
+        self.rps_mlp_out = nn.Linear(config.d_model, config.d_model)
         # When `init_device="meta"` FSDP will call `reset_parameters()` to initialize weights.
         if init_params:# and self.config.init_device != "meta":
             manual_init_talk_model(self, self.config)
@@ -716,6 +727,7 @@ class TalkModel(nn.Module):
 
         # decoder layers
         all_hidden_states = []
+        block_hidden_states = []
 
         # Apply blocks one-by-one.
         if self.config.block_group_size == 1:
@@ -761,6 +773,7 @@ class TalkModel(nn.Module):
                         x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,
                                         #  replace_position=replace_position
                                          )
+                block_hidden_states.append(x)
                         
                 if attn_key_values is not None:
                     assert cache is not None
@@ -781,6 +794,7 @@ class TalkModel(nn.Module):
                 x, cache = block_group(
                     x, attention_bias=attention_bias, layers_past=layers_past, use_cache=use_cache
                 )
+                block_hidden_states.append(x)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.extend(cache)
@@ -792,6 +806,7 @@ class TalkModel(nn.Module):
         # Apply final layer norm.
         # shape: (batch_size, seq_len or 1, d_model)
         x = self.transformer.ln_f(x)  # type: ignore
+        decode_hidden = x
         if output_hidden_states:
             # add final hidden state post-final-layernorm, following HuggingFace's convention
             all_hidden_states.append(x)
@@ -805,14 +820,30 @@ class TalkModel(nn.Module):
         # if self.config.scale_logits:
         #     logits.mul_(1 / math.sqrt(self.config.d_model))
 
-        if rps_residual["enabled"] and output_hidden_states:
+        rps_cfg = rps_residual or {"enabled": False}
+        if rps_cfg["enabled"] and output_hidden_states:
+            source_layer = int(rps_cfg.get("source_layer", -1))
+            use_mlp = bool(rps_cfg.get("use_mlp", False))
+
+            if source_layer == -1 or len(block_hidden_states) == 0:
+                src_hidden = decode_hidden
+            else:
+                if source_layer < 0:
+                    source_layer = len(block_hidden_states) + source_layer
+                source_layer = max(0, min(source_layer, len(block_hidden_states) - 1))
+                src_hidden = block_hidden_states[source_layer]
+
+            if use_mlp:
+                update_hidden = self.rps_mlp_out(F.silu(self.rps_mlp_in(src_hidden)))
+            else:
+                update_hidden = src_hidden
+
             rps_in = self.rps_norm(input_repres)
-            x_last = all_hidden_states[-1]  # post ln_f
-            gate = torch.sigmoid(self.rps_gate(x_last))
-            rps_next = rps_in + rps_residual["eta"] * gate * x_last
+            gate = torch.sigmoid(self.rps_gate(src_hidden))
+            rps_next = rps_in + rps_cfg["eta"] * gate * update_hidden
             # keep in same space
             rps_next = self.rps_post_norm(rps_next)
-            all_hidden_states[-1] = rps_next
+            all_hidden_states.append(rps_next)
 
         return LLaDAOutput(logits=None, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
 
@@ -1172,9 +1203,16 @@ class T3Model(nn.Module):
                 last_logits_only=False,
                 output_hidden_states=output_hidden_states,
             )
+            if outputs.hidden_states is None:
+                raise RuntimeError("Talk forward requires output_hidden_states=True")
 
-            inputs_repres = outputs.hidden_states[-1]
-            logits = self.lm_head_talk(inputs_repres)
+            if self.rps_residual.get("enabled", False) and len(outputs.hidden_states) >= 2:
+                decode_hidden = outputs.hidden_states[-2]
+                inputs_repres = outputs.hidden_states[-1]
+            else:
+                decode_hidden = outputs.hidden_states[-1]
+                inputs_repres = outputs.hidden_states[-1]
+            logits = self.lm_head_talk(decode_hidden)
 
         return CausalLMOutputWithPast(
             logits=logits,
