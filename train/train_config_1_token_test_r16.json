@@ -128,7 +128,10 @@
         "top_k": 64,
         "temperature": 1.2
     },
-    "prune_last_n_layer": 2,
+    "talk_model": {
+        "prune_last_n_layer": 2,
+        "n_layers": 2
+    },
     "mix_indexes": [11, 21],
     "denoise": {
         "steps": 1,
