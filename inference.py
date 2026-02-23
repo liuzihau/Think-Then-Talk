@@ -3,13 +3,14 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 from model.modeling_t3 import T3Model
-from utils import load_ckpt, denoise_k_step_soft_embed_v2
+from utils import load_ckpt, denoise_k_step_soft_embed_v2, select_reveal_positions
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--ckpt_path", type=str, default="cfg5-8-32-2/state_0")
+# parser.add_argument("--ckpt_path", type=str, default="stage2-b8-warmstart-arforce-8-128-1/state_3")
+parser.add_argument("--ckpt_path", type=str, default="1token-1-512-1/state_0")
 parser.add_argument("--gen_length", type=int, default=128)
 parser.add_argument("--steps", type=int, default=128)
-parser.add_argument("--block_size", type=int, default=8)
+parser.add_argument("--block_size", type=int, default=1)
 parser.add_argument("--think_device1", type=str, default="cuda:0")
 parser.add_argument("--think_device2", type=str, default="cuda:0")
 parser.add_argument("--talk_device", type=str, default="cuda:0")
@@ -29,6 +30,9 @@ tokenizer = AutoTokenizer.from_pretrained(model_config["pretrained_model_name_or
 model = T3Model(model_config, think_dev1=THINK_DEVICE1, think_dev2=THINK_DEVICE2, talk_dev=TALK_DEVICE)
 model.eval()
 load_ckpt(args.ckpt_path, model, None, None, map_location="cpu")
+denoise_cfg = model_config.get("denoise", {})
+reveal_mode = str(denoise_cfg.get("reveal_strategy", "ar_force"))
+reveal_k = int(denoise_cfg.get("reveal_k", 1))
 
 messages = [{
     "role": "system",
@@ -79,7 +83,7 @@ x[:, :seq_len] = input_ids.clone()
 past_key_values = None
 x0 = x[:, :seq_len + args.block_size]
 p0 = position_ids[:, :seq_len + args.block_size]
-print(tokenizer.decode(x0[0].detach().view(-1).tolist()))
+# print(tokenizer.decode(x0[0].detach().view(-1).tolist()))
 attn_mask = attention_mask[:, :x0.shape[-1]]
 attn_bias = attention_bias[:x0.shape[-1], :x0.shape[-1]]
 attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)
@@ -145,16 +149,33 @@ for block_idx in range(GEN_LEN // args.block_size):
                     loss_mask=loss_mask,
                     logits=logits,
                     emb_weight=model.talk_embed_weight,
+                    k_reveal=reveal_k,
                     soft_topk=model_config["soft_inputs"]["top_k"],
                     soft_temp=model_config["soft_inputs"]["temperature"],
-                    mode="ar_force",
+                    mode=reveal_mode,
                     sample_tokens=False,
                     # repetition_penalty=1.4,
                     # temperature=1,
                     # top_p=0.9
                 )
         else:
-            raise NotImplementedError("Currently haven't implement hard embed")
+            # Hard iterative reveal fallback: reveal only k positions each denoise step.
+            idx = select_reveal_positions(
+                loss_mask=loss_mask,
+                logits=logits,
+                k_reveal=reveal_k,
+                mode=reveal_mode,
+            )
+            rows = torch.arange(talk_input_ids.size(0), device=TALK_DEVICE).unsqueeze(1).expand_as(idx)
+            chosen_active = loss_mask.bool().gather(1, idx)
+            rows = rows[chosen_active]
+            cols = idx[chosen_active]
+            pred = logits.argmax(dim=-1)
+            talk_input_ids = talk_input_ids.clone()
+            loss_mask = loss_mask.clone()
+            talk_input_ids[rows, cols] = pred[rows, cols]
+            loss_mask[rows, cols] = 0
+            talk_input_embeds = F.embedding(talk_input_ids, model.talk_embed_weight)
         
     if TALK_DEVICE != THINK_DEVICE1:
         talk_input_ids = talk_input_ids.to(THINK_DEVICE1)

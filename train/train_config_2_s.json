@@ -1,0 +1,150 @@
+{
+    "data": {
+        "train_dataset": "nvidia/Llama-Nemotron-Post-Training-Dataset",
+        "block_size": 8,
+        "block_num": 128
+    },
+    "init_from_state_dir": "1token-1-512-1/state_0",
+    "bf16": {
+        "enabled": true
+    },
+    "fp16": {
+        "enabled": false,
+        "auto_cast": "true",
+        "loss_scale": 0,
+        "loss_scale_window": 1000,
+        "initial_scale_power": 14,
+        "hysteresis": 2,
+        "min_loss_scale": 1
+    },
+    "optimizer": {
+        "type": "AdamW",
+        "params": {
+            "lr": {
+                "lora":1.5e-5,
+                "talk":3e-5,
+                "lm_head": 1e-6
+            },
+            "weight_decay": {
+                "lora":0.0,
+                "talk":0.0,
+                "lm_head":0.0
+            },
+            "adam_w_mode": true,
+            "betas": [
+                    0.9,
+                    0.95
+                  ]
+        }
+    },
+    "scheduler": {
+        "type": "WarmupDecayLR",
+        "params": {
+            "warmup_min_lr": 0,
+            "warmup_max_lr": 3e-5,
+            "warmup_num_steps": 1800,
+            "total_num_steps": 90000
+        }
+    },
+    "zero_optimization": {
+        "stage": 2,
+        "stage3_gather_16bit_weights_on_model_save": true,
+        "allgather_partitions": true,
+        "allgather_bucket_size": 2e8,
+        "overlap_comm": true,
+        "reduce_scatter": true,
+        "reduce_bucket_size": 2e8,
+        "contiguous_gradients": true
+    },
+    "gradient_accumulation_steps": 1,
+    "gradient_clipping": 4,
+    "steps_per_print": 2000,
+    "train_micro_batch_size_per_gpu": 1,
+    "wall_clock_breakdown": false,
+    "training_parameters": {
+        "wandb_name": "stage2-b8-warmstart-arforce",
+        "bs": 4,
+        "num_epochs": 10,
+        "num_workers": 2,
+        "max_len": 4096,
+        "gradient_checkpointing": true
+    },
+    "loss": {
+        "type": "token_nll",                 
+        "reduction": "sum_count",            
+        "mask_init": "all_ones",             
+        "mask_dtype": "float32",
+
+        "step_agg": {
+            "enabled": true,
+            "weight_type": "exp_decay",        
+            "base": 0.9,                       
+            "cap_step": 7,                    
+            "min_weight": 0.3,                 
+            "max_weight": 1e9                  
+        },
+
+        "step0_boost": {
+            "enabled": true,
+            "mode": "linear_smooth",       
+            "start_multiplier": 0.25,           
+            "end_multiplier": 1.0,             
+            "over_epochs": 3                   
+        },
+
+        "normalize": {
+            "by_weighted_count": true,         
+            "count_clamp_min": 1e-6
+        },
+
+        "extra": {
+            "label_smoothing": 0.0,            
+            "ignore_index": -100              
+        }
+    },
+    "lora": {
+        "enabled": true,
+        "start_layer": 11,
+        "r": 8,
+        "alpha": 16,
+        "dropout": 0.05,
+        "use_dora": true,
+        "target_modules": {
+            "LLaDA": ["q_proj", "k_proj", "v_proj"],
+            "Qwen3": ["q_proj", "k_proj", "v_proj", "o_proj","gate_proj", "up_proj", "down_proj"]
+        }
+    },
+    "train_lm_head": {
+        "enabled":false
+    },
+    "rps_residual": {
+        "enabled": true,
+        "type": "gated",
+        "eta": 0.2,
+        "norm": "rmsnorm",
+        "source_layer": -1,
+        "use_mlp": false
+    },
+    "soft_inputs": {
+        "enabled": true,
+        "top_k": 64,
+        "temperature": 1.2,
+        "lam_max":0.7, 
+        "lam_min":0.2        
+    },
+    "talk_model": {
+        "prune_last_n_layer": 2,
+        "n_layers": 2
+    },
+    "mix_indexes": [11, 21],
+    "denoise": {
+        "steps": 8,
+        "reveal_k": 1,
+        "reveal_prob": 1.0,
+        "reveal_strategy": "ar_force"
+    },
+    "detach_recurrence": {
+        "enabled": true,
+        "every_r_steps": 4
+    }
+}
