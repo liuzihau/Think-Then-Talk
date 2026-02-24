@@ -4,7 +4,7 @@
         "block_size": 2,
         "block_num": 512
     },
-    "init_from_state_dir": "cfg5-r16-a32-1-512-1/stete_2",
+    "init_from_state_dir": "cfg5-r16-a32-1-512-1/state_2",
     "bf16": {
         "enabled": true
     },
