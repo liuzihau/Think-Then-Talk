@@ -4,7 +4,7 @@
         "block_size": 2,
         "block_num": 512
     },
-    "init_from_state_dir": "cfg5-r16-a32-1-512-1",
+    "init_from_state_dir": "cfg5-r16-a32-1-512-1/stete_2",
     "bf16": {
         "enabled": true
     },
@@ -88,9 +88,9 @@
         "step0_boost": {
             "enabled": true,
             "mode": "linear_smooth",       
-            "start_multiplier": 1.0,           
-            "end_multiplier": 2.0,             
-            "over_epochs": 4                   
+            "start_multiplier": 0.25,           
+            "end_multiplier": 1.0,             
+            "over_epochs": 3                   
         },
 
         "normalize": {
@@ -127,7 +127,7 @@
         "use_mlp": true
     },
     "soft_inputs": {
-        "enabled": true,
+        "enabled": false,
         "top_k": 64,
         "temperature": 1.2
     },
