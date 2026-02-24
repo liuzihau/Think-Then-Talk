@@ -2,7 +2,7 @@
     "data": {
         "train_dataset": "nvidia/Llama-Nemotron-Post-Training-Dataset",
         "block_size": 2,
-        "block_num": 512
+        "block_num": 256
     },
     "init_from_state_dir": "cfg5-r16-a32-1-512-1/state_2",
     "bf16": {
