@@ -19,6 +19,7 @@ def build_dataset_rank(
     test_split_ratio: float = 0.05,
     get_test_subset: bool = False,
     seed: int = 42,
+    short_target_mode: str = "skip",  # "pad_eos" or "skip"
 ):
     """
     datapaths:
@@ -71,6 +72,23 @@ def build_dataset_rank(
         s = s.strip()
         return re.sub(r"[^\w\-.]+", "_", s)
 
+    def _resolve_split(datapath: str, requested_split: str, use_test_split: bool) -> str:
+        # Keep backward compatibility: explicit split always wins.
+        if requested_split != "auto":
+            return requested_split
+        repo_id, _ = _parse_hf_id(datapath)
+        if repo_id == "gsm8k":
+            return "test" if use_test_split else "train"
+        if repo_id in {"cais/mmlu", "hendrycks_test"}:
+            return "test" if use_test_split else "auxiliary_train"
+        if repo_id in {"openai/openai_humaneval", "openai_humaneval"}:
+            return "test"
+        if repo_id == "nvidia/Llama-Nemotron-Post-Training-Dataset":
+            return "chat"
+        if repo_id == "allenai/tulu-3-sft-mixture":
+            return "train"
+        return requested_split
+
     def _ensure_pad_token():
         # keep your behaviour: if pad token missing, use unk
         if tokenizer.pad_token_id is None:
@@ -120,10 +138,42 @@ def build_dataset_rank(
         target = full_ids[len(input_ids):]
 
         if len(target) < target_len:
-            return None
+            if short_target_mode == "skip":
+                return None
+            if short_target_mode == "pad_eos":
+                eos_id = getattr(tokenizer, "eos_token_id", None)
+                if eos_id is None:
+                    _ensure_pad_token()
+                    eos_id = tokenizer.pad_token_id
+                if eos_id is None:
+                    eos_id = getattr(tokenizer, "unk_token_id", 0)
+                target = target + [int(eos_id)] * (target_len - len(target))
+            else:
+                raise ValueError(
+                    f"Unsupported short_target_mode={short_target_mode}. Use 'pad_eos' or 'skip'."
+                )
 
         attention_mask = [1] * len(input_ids)
         return input_ids, target, attention_mask
+
+    def _mmlu_answer_to_index(answer: Any, num_choices: int) -> Optional[int]:
+        if answer is None:
+            return None
+        if isinstance(answer, (int, np.integer)):
+            idx = int(answer)
+            return idx if 0 <= idx < num_choices else None
+        if isinstance(answer, str):
+            s = answer.strip()
+            if not s:
+                return None
+            if s.isdigit():
+                idx = int(s)
+                return idx if 0 <= idx < num_choices else None
+            ch = s[0].upper()
+            if "A" <= ch <= "Z":
+                idx = ord(ch) - ord("A")
+                return idx if 0 <= idx < num_choices else None
+        return None
 
     # -----------------------------
     # Dataset-specific “adapters”
@@ -135,7 +185,9 @@ def build_dataset_rank(
         """
         conversations: List[str] = []
 
-        if datapath == "nvidia/Llama-Nemotron-Post-Training-Dataset":
+        repo_id, _ = _parse_hf_id(datapath)
+
+        if repo_id == "nvidia/Llama-Nemotron-Post-Training-Dataset":
             data_pts = len(examples.get("input", []))
             for i in range(data_pts):
                 source = examples["input"][i]
@@ -158,7 +210,7 @@ def build_dataset_rank(
 
             return conversations
 
-        if datapath == "allenai/tulu-3-sft-mixture":
+        if repo_id == "allenai/tulu-3-sft-mixture":
             data_pts = len(examples.get("messages", []))
             for i in range(data_pts):
                 source = examples["messages"][i]
@@ -175,6 +227,76 @@ def build_dataset_rank(
                     messages.append({"role": msg["role"], "content": msg["content"]})
                     if msg.get("role") == "assistant":
                         conversations.append(_apply_chat_template(messages))
+
+            return conversations
+
+        if repo_id == "gsm8k":
+            data_pts = len(examples.get("question", []))
+            for i in range(data_pts):
+                question = examples["question"][i]
+                answer = examples["answer"][i]
+                if not question or not answer:
+                    continue
+                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                messages.append({"role": "user", "content": question})
+                messages.append({"role": "assistant", "content": answer})
+                conversations.append(_apply_chat_template(messages))
+
+            return conversations
+
+        if repo_id in {"openai/openai_humaneval", "openai_humaneval"}:
+            prompts = examples.get("prompt", [])
+            solutions = examples.get("canonical_solution", [])
+            data_pts = min(len(prompts), len(solutions))
+            for i in range(data_pts):
+                prompt = prompts[i]
+                solution = solutions[i]
+                if not prompt or not solution:
+                    continue
+                user_prompt = (
+                    "Complete the following Python function.\n\n"
+                    f"{prompt}"
+                )
+                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                messages.append({"role": "user", "content": user_prompt})
+                messages.append({"role": "assistant", "content": solution})
+                conversations.append(_apply_chat_template(messages))
+
+            return conversations
+
+        if repo_id in {"cais/mmlu", "hendrycks_test"}:
+            questions = examples.get("question", [])
+            choices_all = examples.get("choices", [])
+            answers = examples.get("answer", [])
+            data_pts = min(len(questions), len(choices_all), len(answers))
+            for i in range(data_pts):
+                question = questions[i]
+                choices = choices_all[i]
+                answer = answers[i]
+                if not question or not choices:
+                    continue
+                answer_idx = _mmlu_answer_to_index(answer, len(choices))
+                if answer_idx is None:
+                    continue
+
+                options = []
+                for j, choice_text in enumerate(choices):
+                    label = chr(ord("A") + j)
+                    options.append(f"{label}. {choice_text}")
+                choices_text = "\n".join(options)
+                user_prompt = (
+                    "Choose the correct option for the following question.\n\n"
+                    f"Question: {question}\n\n"
+                    f"Options:\n{choices_text}"
+                )
+                answer_label = chr(ord("A") + answer_idx)
+                answer_text = choices[answer_idx]
+                assistant = f"The correct answer is {answer_label}. {answer_text}"
+
+                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                messages.append({"role": "user", "content": user_prompt})
+                messages.append({"role": "assistant", "content": assistant})
+                conversations.append(_apply_chat_template(messages))
 
             return conversations
 
@@ -216,7 +338,17 @@ def build_dataset_rank(
 
     final_ds = None
 
+    if len(all_splits) == 1 and len(paths) > 1:
+        all_splits = all_splits * len(paths)
+    if len(paths) != len(all_splits):
+        raise ValueError(
+            f"paths ({len(paths)}) and splits ({len(all_splits)}) must have same length "
+            "or splits must provide exactly one value."
+        )
+
     for datapath, split in zip(paths, all_splits):
+        split = _resolve_split(datapath, split, get_test_subset)
+
         # 1) Load raw dataset (from disk or HF and cache)
         if _is_local_saved_dataset(datapath):
             ds = load_from_disk(datapath)
@@ -257,7 +389,9 @@ def build_dataset_rank(
         processed_root.mkdir(parents=True, exist_ok=True)
 
         tok_id = getattr(tokenizer, "name_or_path", "unknown_tokenizer")
-        proc_key = _safe_dirname(f"{datapath}:{split}:{tok_id}:max{max_len}:tgt{target_len}:seed{seed}:v1")
+        proc_key = _safe_dirname(
+            f"{datapath}:{split}:{tok_id}:max{max_len}:tgt{target_len}:seed{seed}:short{short_target_mode}:v2"
+        )
         processed_path = processed_root / proc_key / ("test" if get_test_subset else "train")
         print(processed_path)
 
@@ -458,7 +592,7 @@ def build_block_attention_mask(
     return m
 
 class DataCollatorWithPaddingV2:
-    def __init__(self, block_size: int=32, block_num: int=8, mask_token_id: int=126336, pad_token_id: int=126081, eos_token_id: int=126081, start_end_ratio: float=0.2, max_start_mode: str="exceed_end"):
+    def __init__(self, block_size: int=32, block_num: int=8, mask_token_id: int=126336, pad_token_id: int=126081, eos_token_id: int=126348, start_end_ratio: float=0.2, max_start_mode: str="exceed_end"):
         self.block_size = block_size
         self.block_num = block_num
         self.total_length = self.block_size * self.block_num
