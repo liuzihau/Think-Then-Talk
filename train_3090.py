@@ -97,6 +97,15 @@ def build_step_weights(loss_cfg: dict, num_steps: int, epoch: int):
                 eff_i = min(i, cap_step)
                 w.append(base ** eff_i)
             w = torch.tensor(w, dtype=torch.float32)
+        elif weight_type == "manual":
+            manual_w = step_agg.get("manual_weights", [])
+            if not isinstance(manual_w, list) or len(manual_w) == 0:
+                raise ValueError("step_agg.manual_weights must be a non-empty list when weight_type='manual'")
+            if len(manual_w) != num_steps:
+                raise ValueError(
+                    f"manual_weights length ({len(manual_w)}) must match num_steps ({num_steps})"
+                )
+            w = torch.tensor([float(x) for x in manual_w], dtype=torch.float32)
         elif weight_type == "uniform":
             w = torch.ones(num_steps, dtype=torch.float32)
         else:
@@ -505,14 +514,30 @@ def main():
     # Tokenizer / Data
     # -------------------------
     tokenizer = AutoTokenizer.from_pretrained(model_config["pretrained_model_name_or_path"], trust_remote_code=True)
+    tokenizer.eos_token_id = 126348
+    data_cfg = train_config["data"]
+    dataset_splits = data_cfg.get("splits", args.split)
+    short_target_mode = data_cfg.get("short_target_mode", "pad_eos")
 
     traindataset = build_dataset_rank(
-        tokenizer, train_config["data"]["train_dataset"], training_parameters["max_len"], target_len=train_config["data"]["block_size"]*train_config["data"]["block_num"], splits=args.split,
-        get_test_subset=False, seed=SEED
+        tokenizer,
+        data_cfg["train_dataset"],
+        training_parameters["max_len"],
+        target_len=data_cfg["block_size"] * data_cfg["block_num"],
+        splits=dataset_splits,
+        get_test_subset=False,
+        seed=SEED,
+        short_target_mode=short_target_mode,
     )
     testdataset = build_dataset_rank(
-        tokenizer, train_config["data"]["train_dataset"], training_parameters["max_len"], target_len=train_config["data"]["block_size"]*train_config["data"]["block_num"], splits=args.split,
-        get_test_subset=True, seed=SEED
+        tokenizer,
+        data_cfg["train_dataset"],
+        training_parameters["max_len"],
+        target_len=data_cfg["block_size"] * data_cfg["block_num"],
+        splits=dataset_splits,
+        get_test_subset=True,
+        seed=SEED,
+        short_target_mode=short_target_mode,
     )
     print(f"Train data: {len(traindataset)}, Test data: {len(testdataset)}")
 

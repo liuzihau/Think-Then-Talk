@@ -21,7 +21,7 @@ from lm_eval.api.registry import register_model
 from transformers import AutoTokenizer
 
 from model.modeling_t3 import T3Model
-from utils import load_ckpt, denoise_k_step_soft_embed_v2
+from utils import load_ckpt, denoise_k_step_soft_embed_v2, select_reveal_positions
 
 
 def set_seed(seed):
@@ -94,8 +94,14 @@ class T3EvalHarness(LM):
         # In T3, each block gets model.length denoise steps
         self.steps_per_block = self.model.length
         self.num_blocks = self.gen_length // self.block_size
+        denoise_cfg = self.model_config.get("denoise", {})
+        self.reveal_mode = str(denoise_cfg.get("reveal_strategy", "ar_force"))
+        self.reveal_k = int(denoise_cfg.get("reveal_k", 1))
 
-        print(f"[T3Eval] steps_per_block={self.steps_per_block}, num_blocks={self.num_blocks}")
+        print(
+            f"[T3Eval] steps_per_block={self.steps_per_block}, num_blocks={self.num_blocks}, "
+            f"reveal_mode={self.reveal_mode}, reveal_k={self.reveal_k}"
+        )
 
         self._rank = 0
         self._world_size = 1
@@ -111,11 +117,13 @@ class T3EvalHarness(LM):
     @torch.no_grad()
     def t3_generate(self, input_ids):
         """
-        Block-wise generation using T3 model.
-        input_ids: [B, seq_len] prompt token ids on think_device1
-        Returns: ([B, seq_len + gen_length] full sequence, nfe count)
+        Block-wise generation using T3 model (single-sample path, aligned with inference.py).
+        input_ids: [1, seq_len] prompt token ids on think_device1
+        Returns: ([1, seq_len + gen_length] full sequence, nfe count)
         """
         B = input_ids.shape[0]
+        if B != 1:
+            raise ValueError(f"t3_generate expects batch size 1, got {B}")
         seq_len = input_ids.shape[1]
         max_len = seq_len + self.gen_length
 
@@ -230,17 +238,32 @@ class T3EvalHarness(LM):
                         loss_mask=loss_mask,
                         logits=logits,
                         emb_weight=self.model.talk_embed_weight,
+                        k_reveal=self.reveal_k,
                         soft_topk=self.model_config["soft_inputs"]["top_k"],
                         soft_temp=self.model_config["soft_inputs"]["temperature"],
-                        mode="ar_force",
+                        mode=self.reveal_mode,
                         sample_tokens=False,
                     )
                 else:
-                    # Hard argmax fallback
+                    # Hard iterative reveal fallback (same as inference.py)
+                    idx = select_reveal_positions(
+                        loss_mask=loss_mask,
+                        logits=logits,
+                        k_reveal=self.reveal_k,
+                        mode=self.reveal_mode,
+                    )
+                    rows = torch.arange(
+                        talk_input_ids.size(0), device=self.talk_device
+                    ).unsqueeze(1).expand_as(idx)
+                    chosen_active = loss_mask.bool().gather(1, idx)
+                    rows = rows[chosen_active]
+                    cols = idx[chosen_active]
                     pred = logits.argmax(dim=-1)
-                    talk_input_ids = pred
+                    talk_input_ids = talk_input_ids.clone()
+                    loss_mask = loss_mask.clone()
+                    talk_input_ids[rows, cols] = pred[rows, cols]
+                    loss_mask[rows, cols] = 0
                     talk_input_embeds = F.embedding(talk_input_ids, self.model.talk_embed_weight)
-                    loss_mask = torch.zeros_like(loss_mask)
 
             # After denoise loop: update x and prepare next block
             if self.talk_device != self.think_device1:
@@ -382,41 +405,38 @@ class T3EvalHarness(LM):
         raise NotImplementedError
 
     def generate_until(self, requests):
-        output = []
+        output = [None] * len(requests)
         num_tokens = 0
         total_nfe = 0
 
         start_time = time.time()
+        pbar = tqdm(total=len(requests), desc="Generating...")
 
-        for req_idx, req in enumerate(tqdm(requests, desc="Generating...")):
+        for req_idx, req in enumerate(requests):
             question = req.args[0]
             stop_tokens = req.args[1]["until"]
 
-            # Apply chat template
             m = [{"role": "user", "content": question}]
             user_input = self.tokenizer.apply_chat_template(
                 m, add_generation_prompt=True, tokenize=False
             )
-            input_ids = self.tokenizer(
+            ids_1d = self.tokenizer(
                 user_input, return_tensors="pt", add_special_tokens=False
-            ).input_ids
-            input_ids = input_ids.to(self.think_device1)
-            prompt_len = input_ids.shape[1]
+            ).input_ids[0]
 
-            # Generate
-            generated, nfe = self.t3_generate(input_ids)
+            prompt_len = int(ids_1d.shape[0])
+            input_batch = ids_1d.unsqueeze(0).to(self.think_device1)
+
+            generated, nfe = self.t3_generate(input_batch)
             total_nfe += nfe
 
-            # Decode generated part only
             gen_ids = generated[0, prompt_len:]
             gen_text = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
 
-            # Truncate at stop tokens
             for stop_seq in stop_tokens:
                 if stop_seq in gen_text:
                     gen_text = gen_text.split(stop_seq)[0]
 
-            # Re-tokenize and decode to clean up
             gen_ids_clean = self.tokenizer(gen_text)["input_ids"]
             if self.show_speed:
                 num_tokens += sum(1 for t in gen_ids_clean if t != 126081)
@@ -424,14 +444,17 @@ class T3EvalHarness(LM):
             gen_text_clean = self.tokenizer.decode(
                 gen_ids_clean, skip_special_tokens=True
             )
-
-            output.append(gen_text_clean)
+            output[req_idx] = gen_text_clean
 
             if req_idx < 3 or req_idx % 100 == 0:
                 print("=" * 20)
                 print(f"[{req_idx}/{len(requests)}] answer:", gen_text_clean[:200])
                 print("nfe:", nfe)
                 print("=" * 20)
+
+            pbar.update(1)
+
+        pbar.close()
 
         end_time = time.time()
         if self.show_speed:
