@@ -68,6 +68,15 @@ def build_dataset_rank(
             return repo_id, (config if config else None)
         return s, None
 
+    def _default_hf_config(repo_id: str, config: Optional[str]) -> Optional[str]:
+        if config is not None:
+            return config
+        if repo_id == "gsm8k":
+            return "main"
+        if repo_id in {"cais/mmlu", "hendrycks_test"}:
+            return "all"
+        return None
+
     def _safe_dirname(s: str) -> str:
         s = s.strip()
         return re.sub(r"[^\w\-.]+", "_", s)
@@ -354,6 +363,7 @@ def build_dataset_rank(
             ds = load_from_disk(datapath)
         else:
             repo_id, config = _parse_hf_id(datapath)
+            config = _default_hf_config(repo_id, config)
             cache_key = repo_id if config is None else f"{repo_id}:{config}"
             raw_local_path = cache_root / _safe_dirname(cache_key) / split
 

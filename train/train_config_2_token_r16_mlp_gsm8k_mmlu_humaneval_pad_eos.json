@@ -1,6 +1,6 @@
 {
     "data": {
-        "train_dataset": "gsm8k,cais/mmlu,openai/openai_humaneval",
+        "train_dataset": "gsm8k:main,cais/mmlu:all,openai/openai_humaneval",
         "splits": "auto",
         "short_target_mode": "pad_eos",
         "block_size": 4,
