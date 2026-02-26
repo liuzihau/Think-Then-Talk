@@ -4,7 +4,7 @@
         "splits": "auto",
         "short_target_mode": "pad_eos",
         "block_size": 4,
-        "block_num": 64
+        "block_num": 16
     },
     "init_from_state_dir": "cfg5-r16-a32-b4-mlp-4-64-1/state_1",
     "bf16": {
@@ -65,7 +65,7 @@
     "wall_clock_breakdown": false,
     "training_parameters": {
         "wandb_name": "cfg5-r16-a32-b4-mlp-gsm8k-mmlu-humaneval",
-        "bs": 4,
+        "bs": 16,
         "num_epochs": 10,
         "num_workers": 2,
         "max_len": 4096,
@@ -81,7 +81,7 @@
         "step_agg": {
             "enabled": true,
             "weight_type": "manual",
-            "manual_weights": [0.1, 0.2, 0.9, 0.81],
+            "manual_weights": [1, 0.9, 0.9, 0.81],
             "base": 0.9,
             "cap_step": 7,                    
             "min_weight": 0.0,                 
