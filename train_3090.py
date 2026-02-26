@@ -8,7 +8,7 @@ Single-process, pure PyTorch training:
 - PyTorch-style checkpoint saving (talk_model + optimizer + scheduler + meta)
 """
 
-import os, re, json
+import os, re, json, inspect
 import argparse
 import math
 import numpy as np
@@ -517,27 +517,32 @@ def main():
     tokenizer.eos_token_id = 126348
     data_cfg = train_config["data"]
     dataset_splits = data_cfg.get("splits", args.split)
-    short_target_mode = data_cfg.get("short_target_mode", "pad_eos")
+    short_target_mode = data_cfg.get("short_target_mode", "skip")
+    build_dataset_rank_params = inspect.signature(build_dataset_rank).parameters
+    dataset_common_kwargs = dict(
+        splits=dataset_splits,
+        seed=SEED,
+    )
+    if "short_target_mode" in build_dataset_rank_params:
+        dataset_common_kwargs["short_target_mode"] = short_target_mode
+    else:
+        print("[Data] build_dataset_rank has no short_target_mode; using legacy behavior.")
 
     traindataset = build_dataset_rank(
         tokenizer,
         data_cfg["train_dataset"],
         training_parameters["max_len"],
         target_len=data_cfg["block_size"] * data_cfg["block_num"],
-        splits=dataset_splits,
         get_test_subset=False,
-        seed=SEED,
-        short_target_mode=short_target_mode,
+        **dataset_common_kwargs,
     )
     testdataset = build_dataset_rank(
         tokenizer,
         data_cfg["train_dataset"],
         training_parameters["max_len"],
         target_len=data_cfg["block_size"] * data_cfg["block_num"],
-        splits=dataset_splits,
         get_test_subset=True,
-        seed=SEED,
-        short_target_mode=short_target_mode,
+        **dataset_common_kwargs,
     )
     print(f"Train data: {len(traindataset)}, Test data: {len(testdataset)}")
 
