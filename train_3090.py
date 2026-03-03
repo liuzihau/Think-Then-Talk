@@ -425,7 +425,7 @@ def split_params(model):
         if not p.requires_grad:
             continue
         nl = n.lower()
-        if ("lm_head" in nl) or ("ff_out" in nl):
+        if n in ("talk_lm_head_weight", "talk_lm_head_bias"):
             lm_head_params.append(p)
         elif "lora" in nl:
             lora_params.append(p)
@@ -484,6 +484,10 @@ def main():
     model_config["talk_model"]["n_layers"] = train_config["talk_model"]["n_layers"]
     model_config["mix_indexes"] = train_config["mix_indexes"]
     model_config["denoise"] = train_config["denoise"]
+    if "think_split" in train_config:
+        model_config["think_split"] = train_config["think_split"]
+    if "train_lm_head" in train_config:
+        model_config["train_lm_head"] = train_config["train_lm_head"]
     if train_config["lora"]["enabled"]:
         model_config['lora'] = train_config["lora"]
     if train_config['rps_residual']['enabled']:
@@ -523,6 +527,12 @@ def main():
         splits=dataset_splits,
         seed=SEED,
     )
+    if "test_split_ratio" in build_dataset_rank_params:
+        dataset_common_kwargs["test_split_ratio"] = data_cfg.get("test_split_ratio", 0.05)
+    if "train_subset_percents" in build_dataset_rank_params:
+        dataset_common_kwargs["train_subset_percents"] = data_cfg.get("train_subset_percents", None)
+    if "test_subset_percents" in build_dataset_rank_params:
+        dataset_common_kwargs["test_subset_percents"] = data_cfg.get("test_subset_percents", None)
     if "short_target_mode" in build_dataset_rank_params:
         dataset_common_kwargs["short_target_mode"] = short_target_mode
     else:
@@ -550,6 +560,7 @@ def main():
         traindataset,
         batch_size=training_parameters["bs"],
         num_workers=1,
+        shuffle=True,
         pin_memory=True,
         collate_fn=DataCollatorWithPaddingV2(block_size=train_config["data"]["block_size"], block_num=train_config["data"]["block_num"])
     )
@@ -577,12 +588,17 @@ def main():
     print(f"lora trainable params: {sum(p.numel() for p in lora_params):,}")
     print(f"lm_head trainable params: {sum(p.numel() for p in lm_head_params):,}")
     print(f"other trainable params: {sum(p.numel() for p in other_params):,}")
+    if train_config["train_lm_head"]["enabled"] and len(lm_head_params) == 0:
+        print("[WARN] train_lm_head is enabled but no talk_lm_head parameters were found.")
     
     param_groups = [{"name": "talk", "params": talk_params + other_params, "lr": lr_dict['talk'], "weight_decay": weight_decay["talk"]}]
     if train_config["lora"]["enabled"]:
         param_groups.append({"name": "lora", "params": lora_params, "lr": lr_dict["lora"], "weight_decay": weight_decay["lora"]})
     if train_config["train_lm_head"]["enabled"]:
         param_groups.append({"name": "lm_head", "params": lm_head_params, "lr": lr_dict["lm_head"], "weight_decay": weight_decay["lm_head"]})
+    for g in param_groups:
+        n_params = sum(p.numel() for p in g["params"])
+        print(f"[OPT] group={g['name']}, lr={g['lr']}, wd={g['weight_decay']}, params={n_params:,}")
 
     optimizer = torch.optim.AdamW(
         param_groups,

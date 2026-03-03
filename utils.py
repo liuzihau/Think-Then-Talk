@@ -45,6 +45,10 @@ def save_ckpt(save_root, epoch, model, optimizer, scheduler, extra=None,model_co
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
     }
+    if hasattr(model, "talk_lm_head_weight") and model.talk_lm_head_weight is not None:
+        payload["talk_lm_head_weight"] = model.talk_lm_head_weight.detach().cpu()
+    if hasattr(model, "talk_lm_head_bias") and model.talk_lm_head_bias is not None:
+        payload["talk_lm_head_bias"] = model.talk_lm_head_bias.detach().cpu()
 
     # Save think LoRA if exists
     if hasattr(model, "think_model") and _has_lora_params(model.think_model):
@@ -79,6 +83,20 @@ def load_ckpt(state_dir, model, optimizer=None, scheduler=None, map_location="cp
     if "talk_model" not in ckpt:
         raise KeyError(f"ckpt missing 'talk_model': {ckpt_path}")
     model.talk_model.load_state_dict(ckpt["talk_model"], strict=strict_talk)
+
+    # optional: talk lm_head params (newer checkpoints)
+    if "talk_lm_head_weight" in ckpt and hasattr(model, "talk_lm_head_weight") and model.talk_lm_head_weight is not None:
+        w = ckpt["talk_lm_head_weight"].to(model.talk_lm_head_weight.device, dtype=model.talk_lm_head_weight.dtype)
+        if isinstance(model.talk_lm_head_weight, torch.nn.Parameter):
+            model.talk_lm_head_weight.data.copy_(w)
+        else:
+            model.talk_lm_head_weight = w
+    if "talk_lm_head_bias" in ckpt and hasattr(model, "talk_lm_head_bias") and model.talk_lm_head_bias is not None:
+        b = ckpt["talk_lm_head_bias"].to(model.talk_lm_head_bias.device, dtype=model.talk_lm_head_bias.dtype)
+        if isinstance(model.talk_lm_head_bias, torch.nn.Parameter):
+            model.talk_lm_head_bias.data.copy_(b)
+        else:
+            model.talk_lm_head_bias = b
 
     # 2) think LoRA (optional)
     if "think_lora" in ckpt:

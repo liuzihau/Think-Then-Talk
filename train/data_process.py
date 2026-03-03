@@ -19,7 +19,9 @@ def build_dataset_rank(
     test_split_ratio: float = 0.05,
     get_test_subset: bool = False,
     seed: int = 42,
-    short_target_mode: str = "skip",  # "pad_eos" or "skip"
+    short_target_mode: str = "skip",  # "pad_eos", "skip", or "keep"
+    train_subset_percents: Optional[str] = None,
+    test_subset_percents: Optional[str] = None,
 ):
     """
     datapaths:
@@ -39,13 +41,13 @@ def build_dataset_rank(
     # -----------------------------
     # Helpers
     # -----------------------------
-    SYSTEM_PROMPT = (
-        "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  "
-        "Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. "
-        "Please ensure that your responses are socially unbiased and positive in nature.\n\n"
-        "If a question does not make any sense, or is not factually coherent, explain why instead of answering something "
-        "not correct. If you don't know the answer to a question, please don't share false information."
-    )
+    # SYSTEM_PROMPT = (
+    #     "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  "
+    #     "Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. "
+    #     "Please ensure that your responses are socially unbiased and positive in nature.\n\n"
+    #     "If a question does not make any sense, or is not factually coherent, explain why instead of answering something "
+    #     "not correct. If you don't know the answer to a question, please don't share false information."
+    # )
 
     SEP = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     ROLES_OK = {"human", "user", "gpt", "assistant"}
@@ -81,6 +83,27 @@ def build_dataset_rank(
         s = s.strip()
         return re.sub(r"[^\w\-.]+", "_", s)
 
+    def _parse_percent_list(v: Optional[str], n: int, name: str) -> Optional[List[float]]:
+        if v is None:
+            return None
+        parts = [x.strip() for x in str(v).split(",") if x.strip()]
+        if not parts:
+            return None
+        if len(parts) == 1 and n > 1:
+            parts = parts * n
+        if len(parts) != n:
+            raise ValueError(
+                f"{name} has {len(parts)} values, but datapaths has {n}. "
+                "Provide one value or one per datapath."
+            )
+        out: List[float] = []
+        for p in parts:
+            fp = float(p)
+            if fp < 0 or fp > 100:
+                raise ValueError(f"{name} values must be in [0, 100], got {fp}")
+            out.append(fp)
+        return out
+
     def _resolve_split(datapath: str, requested_split: str, use_test_split: bool) -> str:
         # Keep backward compatibility: explicit split always wins.
         if requested_split != "auto":
@@ -97,6 +120,20 @@ def build_dataset_rank(
         if repo_id == "allenai/tulu-3-sft-mixture":
             return "train"
         return requested_split
+
+    def _use_native_train_test_split(datapath: str, requested_split: str) -> bool:
+        # For datasets that already have canonical train/test (or test-only) splits,
+        # avoid applying an extra random train_test_split when using auto split.
+        if requested_split != "auto":
+            return False
+        repo_id, _ = _parse_hf_id(datapath)
+        return repo_id in {
+            "gsm8k",
+            "cais/mmlu",
+            "hendrycks_test",
+            "openai/openai_humaneval",
+            "openai_humaneval",
+        }
 
     def _ensure_pad_token():
         # keep your behaviour: if pad token missing, use unk
@@ -157,9 +194,12 @@ def build_dataset_rank(
                 if eos_id is None:
                     eos_id = getattr(tokenizer, "unk_token_id", 0)
                 target = target + [int(eos_id)] * (target_len - len(target))
+            elif short_target_mode == "keep":
+                # Keep short targets as-is. Collator handles padding for each batch.
+                pass
             else:
                 raise ValueError(
-                    f"Unsupported short_target_mode={short_target_mode}. Use 'pad_eos' or 'skip'."
+                    f"Unsupported short_target_mode={short_target_mode}. Use 'pad_eos', 'skip', or 'keep'."
                 )
 
         attention_mask = [1] * len(input_ids)
@@ -210,7 +250,8 @@ def build_dataset_rank(
                         print("bad_source_role")
                     continue
 
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                # messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                messages = []
                 for msg in source:
                     messages.append({"role": msg["role"], "content": msg["content"]})
                 messages.append({"role": "assistant", "content": response})
@@ -226,7 +267,8 @@ def build_dataset_rank(
                 if not source:
                     continue
 
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                # messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                messages = []
                 if source[0].get("role") == "system":
                     messages[0] = source[0]
                     source = source[1:]
@@ -246,7 +288,8 @@ def build_dataset_rank(
                 answer = examples["answer"][i]
                 if not question or not answer:
                     continue
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                # messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                messages = []
                 messages.append({"role": "user", "content": question})
                 messages.append({"role": "assistant", "content": answer})
                 conversations.append(_apply_chat_template(messages))
@@ -266,7 +309,8 @@ def build_dataset_rank(
                     "Complete the following Python function.\n\n"
                     f"{prompt}"
                 )
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                # messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                messages = []
                 messages.append({"role": "user", "content": user_prompt})
                 messages.append({"role": "assistant", "content": solution})
                 conversations.append(_apply_chat_template(messages))
@@ -302,7 +346,8 @@ def build_dataset_rank(
                 answer_text = choices[answer_idx]
                 assistant = f"The correct answer is {answer_label}. {answer_text}"
 
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                # messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                messages = []
                 messages.append({"role": "user", "content": user_prompt})
                 messages.append({"role": "assistant", "content": assistant})
                 conversations.append(_apply_chat_template(messages))
@@ -341,6 +386,14 @@ def build_dataset_rank(
 
     paths = [p.strip() for p in datapaths.split(",") if p.strip()]
     all_splits = [p.strip() for p in splits.split(",") if p.strip()]
+    train_pcts = _parse_percent_list(train_subset_percents, len(paths), "train_subset_percents")
+    test_pcts = _parse_percent_list(test_subset_percents, len(paths), "test_subset_percents")
+    use_explicit_subset_percents = (train_pcts is not None) or (test_pcts is not None)
+    if use_explicit_subset_percents:
+        if train_pcts is None:
+            train_pcts = [100.0] * len(paths)
+        if test_pcts is None:
+            test_pcts = [0.0] * len(paths)
 
     if not paths:
         raise ValueError("datapaths is empty. Provide at least one dataset path or HF dataset id.")
@@ -355,8 +408,8 @@ def build_dataset_rank(
             "or splits must provide exactly one value."
         )
 
-    for datapath, split in zip(paths, all_splits):
-        split = _resolve_split(datapath, split, get_test_subset)
+    for i_path, (datapath, requested_split) in enumerate(zip(paths, all_splits)):
+        split = _resolve_split(datapath, requested_split, get_test_subset)
 
         # 1) Load raw dataset (from disk or HF and cache)
         if _is_local_saved_dataset(datapath):
@@ -382,7 +435,46 @@ def build_dataset_rank(
         # 2) Shuffle then split (same logic)
         ds = ds.shuffle(seed=seed)
 
-        if test_split_ratio > 0 and len(ds) > 1:
+        use_native_split = _use_native_train_test_split(datapath, requested_split)
+        train_pct_i = train_pcts[i_path] if use_explicit_subset_percents else None
+        test_pct_i = test_pcts[i_path] if use_explicit_subset_percents else None
+        if use_explicit_subset_percents:
+            n_total = len(ds)
+            if use_native_split:
+                # Native train/test datasets are already disjoint by split.
+                pct = float(test_pct_i if get_test_subset else train_pct_i)
+                n_take = int(n_total * (pct / 100.0))
+                ds1 = ds.select(range(n_take)) if n_take > 0 else ds.select([])
+                print(
+                    f"dataset rank: native {'TEST' if get_test_subset else 'TRAIN'} split "
+                    f"taking {pct:.3f}% => {len(ds1)}/{n_total}"
+                )
+            else:
+                # Same source split for both train/test; enforce disjoint partitions.
+                trp = float(train_pct_i)
+                tep = float(test_pct_i)
+                if trp + tep > 100.0 + 1e-9:
+                    raise ValueError(
+                        f"train_subset_percents + test_subset_percents exceeds 100 for {datapath} "
+                        f"(train={trp}, test={tep})."
+                    )
+                n_test = int(n_total * (tep / 100.0))
+                n_train = int(n_total * (trp / 100.0))
+                if get_test_subset:
+                    ds1 = ds.select(range(n_test)) if n_test > 0 else ds.select([])
+                    print(
+                        f"dataset rank: disjoint TEST subset taking {tep:.3f}% "
+                        f"=> {len(ds1)}/{n_total}"
+                    )
+                else:
+                    start = n_test
+                    end = n_test + n_train
+                    ds1 = ds.select(range(start, end)) if n_train > 0 else ds.select([])
+                    print(
+                        f"dataset rank: disjoint TRAIN subset taking {trp:.3f}% "
+                        f"=> {len(ds1)}/{n_total} (after reserving {tep:.3f}% for test)"
+                    )
+        elif test_split_ratio > 0 and len(ds) > 1 and not use_native_split:
             splits = ds.train_test_split(test_size=test_split_ratio, seed=seed)
             ds1 = splits["test"] if get_test_subset else splits["train"]
             print(
@@ -390,7 +482,12 @@ def build_dataset_rank(
             )
         else:
             ds1 = ds
-            print(f"dataset rank: returning FULL dataset ({len(ds1)} examples)")
+            if use_native_split:
+                print(
+                    f"dataset rank: returning native {'TEST' if get_test_subset else 'TRAIN'} split ({len(ds1)} examples)"
+                )
+            else:
+                print(f"dataset rank: returning FULL dataset ({len(ds1)} examples)")
 
         original_columns = ds1.column_names
 
@@ -400,7 +497,10 @@ def build_dataset_rank(
 
         tok_id = getattr(tokenizer, "name_or_path", "unknown_tokenizer")
         proc_key = _safe_dirname(
-            f"{datapath}:{split}:{tok_id}:max{max_len}:tgt{target_len}:seed{seed}:short{short_target_mode}:v2"
+            f"{datapath}:{split}:req{requested_split}:{tok_id}:max{max_len}:tgt{target_len}:"
+            f"seed{seed}:short{short_target_mode}:tsr{test_split_ratio}:"
+            f"trpct{train_pct_i if train_pct_i is not None else 'na'}:"
+            f"tepct{test_pct_i if test_pct_i is not None else 'na'}:v3"
         )
         processed_path = processed_root / proc_key / ("test" if get_test_subset else "train")
         print(processed_path)
