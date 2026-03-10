@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
-from datasets import load_dataset, load_from_disk, concatenate_datasets
+from datasets import Dataset, Features, Sequence, Value, load_dataset, load_from_disk, concatenate_datasets
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -22,6 +22,8 @@ def build_dataset_rank(
     short_target_mode: str = "skip",  # "pad_eos", "skip", or "keep"
     train_subset_percents: Optional[str] = None,
     test_subset_percents: Optional[str] = None,
+    train_subset_offsets: Optional[str] = None,
+    test_subset_offsets: Optional[str] = None,
 ):
     """
     datapaths:
@@ -388,12 +390,23 @@ def build_dataset_rank(
     all_splits = [p.strip() for p in splits.split(",") if p.strip()]
     train_pcts = _parse_percent_list(train_subset_percents, len(paths), "train_subset_percents")
     test_pcts = _parse_percent_list(test_subset_percents, len(paths), "test_subset_percents")
-    use_explicit_subset_percents = (train_pcts is not None) or (test_pcts is not None)
+    train_offsets = _parse_percent_list(train_subset_offsets, len(paths), "train_subset_offsets")
+    test_offsets = _parse_percent_list(test_subset_offsets, len(paths), "test_subset_offsets")
+    use_explicit_subset_percents = (
+        (train_pcts is not None)
+        or (test_pcts is not None)
+        or (train_offsets is not None)
+        or (test_offsets is not None)
+    )
     if use_explicit_subset_percents:
         if train_pcts is None:
             train_pcts = [100.0] * len(paths)
         if test_pcts is None:
             test_pcts = [0.0] * len(paths)
+        if train_offsets is None:
+            train_offsets = [0.0] * len(paths)
+        if test_offsets is None:
+            test_offsets = [0.0] * len(paths)
 
     if not paths:
         raise ValueError("datapaths is empty. Provide at least one dataset path or HF dataset id.")
@@ -438,41 +451,68 @@ def build_dataset_rank(
         use_native_split = _use_native_train_test_split(datapath, requested_split)
         train_pct_i = train_pcts[i_path] if use_explicit_subset_percents else None
         test_pct_i = test_pcts[i_path] if use_explicit_subset_percents else None
+        train_offset_i = train_offsets[i_path] if use_explicit_subset_percents else None
+        test_offset_i = test_offsets[i_path] if use_explicit_subset_percents else None
         if use_explicit_subset_percents:
             n_total = len(ds)
             if use_native_split:
                 # Native train/test datasets are already disjoint by split.
                 pct = float(test_pct_i if get_test_subset else train_pct_i)
+                offset = float(test_offset_i if get_test_subset else train_offset_i)
+                if offset + pct > 100.0 + 1e-9:
+                    raise ValueError(
+                        f"subset offset + percent exceeds 100 for {datapath} "
+                        f"(offset={offset}, pct={pct})."
+                    )
+                start = int(n_total * (offset / 100.0))
                 n_take = int(n_total * (pct / 100.0))
-                ds1 = ds.select(range(n_take)) if n_take > 0 else ds.select([])
+                end = start + n_take
+                ds1 = ds.select(range(start, end)) if end > start else ds.select([])
                 print(
                     f"dataset rank: native {'TEST' if get_test_subset else 'TRAIN'} split "
-                    f"taking {pct:.3f}% => {len(ds1)}/{n_total}"
+                    f"taking {pct:.3f}% from offset {offset:.3f}% => {len(ds1)}/{n_total}"
                 )
             else:
                 # Same source split for both train/test; enforce disjoint partitions.
                 trp = float(train_pct_i)
                 tep = float(test_pct_i)
-                if trp + tep > 100.0 + 1e-9:
-                    raise ValueError(
-                        f"train_subset_percents + test_subset_percents exceeds 100 for {datapath} "
-                        f"(train={trp}, test={tep})."
-                    )
+                tro = float(train_offset_i)
+                teo = float(test_offset_i)
                 n_test = int(n_total * (tep / 100.0))
                 n_train = int(n_total * (trp / 100.0))
+                n_test_offset = int(n_total * (teo / 100.0))
+                n_train_offset = int(n_total * (tro / 100.0))
+                test_start = n_test_offset
+                test_end = test_start + n_test
+                train_start = n_test + n_train_offset
+                train_end = train_start + n_train
+                if teo + tep > 100.0 + 1e-9:
+                    raise ValueError(
+                        f"test_subset_offsets + test_subset_percents exceeds 100 for {datapath} "
+                        f"(offset={teo}, test={tep})."
+                    )
+                if tep + tro + trp > 100.0 + 1e-9:
+                    raise ValueError(
+                        f"reserved test + train_subset_offsets + train_subset_percents exceeds 100 for {datapath} "
+                        f"(test={tep}, offset={tro}, train={trp})."
+                    )
+                if train_start < test_end:
+                    raise ValueError(
+                        f"train subset overlaps test subset for {datapath} "
+                        f"(test_end_idx={test_end}, train_start_idx={train_start})."
+                    )
                 if get_test_subset:
-                    ds1 = ds.select(range(n_test)) if n_test > 0 else ds.select([])
+                    ds1 = ds.select(range(test_start, test_end)) if test_end > test_start else ds.select([])
                     print(
                         f"dataset rank: disjoint TEST subset taking {tep:.3f}% "
-                        f"=> {len(ds1)}/{n_total}"
+                        f"from offset {teo:.3f}% => {len(ds1)}/{n_total}"
                     )
                 else:
-                    start = n_test
-                    end = n_test + n_train
-                    ds1 = ds.select(range(start, end)) if n_train > 0 else ds.select([])
+                    ds1 = ds.select(range(train_start, train_end)) if train_end > train_start else ds.select([])
                     print(
                         f"dataset rank: disjoint TRAIN subset taking {trp:.3f}% "
-                        f"=> {len(ds1)}/{n_total} (after reserving {tep:.3f}% for test)"
+                        f"from offset {tro:.3f}% => {len(ds1)}/{n_total} "
+                        f"(after reserving {tep:.3f}% for test)"
                     )
         elif test_split_ratio > 0 and len(ds) > 1 and not use_native_split:
             splits = ds.train_test_split(test_size=test_split_ratio, seed=seed)
@@ -500,7 +540,9 @@ def build_dataset_rank(
             f"{datapath}:{split}:req{requested_split}:{tok_id}:max{max_len}:tgt{target_len}:"
             f"seed{seed}:short{short_target_mode}:tsr{test_split_ratio}:"
             f"trpct{train_pct_i if train_pct_i is not None else 'na'}:"
-            f"tepct{test_pct_i if test_pct_i is not None else 'na'}:v3"
+            f"tepct{test_pct_i if test_pct_i is not None else 'na'}:"
+            f"troff{train_offset_i if train_offset_i is not None else 'na'}:"
+            f"teoff{test_offset_i if test_offset_i is not None else 'na'}:v4"
         )
         processed_path = processed_root / proc_key / ("test" if get_test_subset else "train")
         print(processed_path)
@@ -508,15 +550,27 @@ def build_dataset_rank(
         if _is_local_saved_dataset(str(processed_path)):
             ds1_proc = load_from_disk(str(processed_path))
         else:
-            preprocess_fn = _make_preprocess_fn(datapath)
-
-            ds1_proc = ds1.map(
-                preprocess_fn,
-                batched=True,
-                num_proc=num_proc,
-                remove_columns=original_columns,
-                load_from_cache_file=False,  # keep your behaviour: rely on save_to_disk instead
-            )
+            if len(ds1) == 0:
+                # Empty splits cannot infer schema via map/save_to_disk, so build
+                # a typed empty dataset matching normal preprocess output.
+                empty_features = Features({
+                    "input_ids": Sequence(Value("int64")),
+                    "target": Sequence(Value("int64")),
+                    "attention_mask": Sequence(Value("int64")),
+                })
+                ds1_proc = Dataset.from_dict(
+                    {"input_ids": [], "target": [], "attention_mask": []},
+                    features=empty_features,
+                )
+            else:
+                preprocess_fn = _make_preprocess_fn(datapath)
+                ds1_proc = ds1.map(
+                    preprocess_fn,
+                    batched=True,
+                    num_proc=num_proc,
+                    remove_columns=original_columns,
+                    load_from_cache_file=False,  # keep your behaviour: rely on save_to_disk instead
+                )
             ds1_proc.save_to_disk(str(processed_path))
 
         # 4) Output format unchanged

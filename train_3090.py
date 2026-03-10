@@ -533,6 +533,10 @@ def main():
         dataset_common_kwargs["train_subset_percents"] = data_cfg.get("train_subset_percents", None)
     if "test_subset_percents" in build_dataset_rank_params:
         dataset_common_kwargs["test_subset_percents"] = data_cfg.get("test_subset_percents", None)
+    if "train_subset_offsets" in build_dataset_rank_params:
+        dataset_common_kwargs["train_subset_offsets"] = data_cfg.get("train_subset_offsets", None)
+    if "test_subset_offsets" in build_dataset_rank_params:
+        dataset_common_kwargs["test_subset_offsets"] = data_cfg.get("test_subset_offsets", None)
     if "short_target_mode" in build_dataset_rank_params:
         dataset_common_kwargs["short_target_mode"] = short_target_mode
     else:
