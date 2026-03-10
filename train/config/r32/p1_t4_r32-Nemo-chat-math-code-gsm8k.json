@@ -70,7 +70,7 @@
     "wall_clock_breakdown": false,
     "training_parameters": {
         "wandb_name": "cfg6-p1-l30-r32-a64-lm-t4-mlp-7.5lr",
-        "bs": 1,
+        "bs": 4,
         "num_epochs": 4,
         "num_workers": 2,
         "max_len": 4096,
