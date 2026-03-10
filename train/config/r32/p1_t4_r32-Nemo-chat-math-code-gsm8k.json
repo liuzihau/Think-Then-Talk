@@ -11,7 +11,7 @@
         "block_size": 4,
         "block_num": 128
     },
-    "init_from_state_dir": "cfg6-p1-l30-r32-a64-lm-t1-mlp-7.5lr-2-128-4/state_2",
+    "init_from_state_dir": "cfg6-p1-l30-r32-a64-lm-t2-mlp-7.5lr-2-128-4/state_2",
     "bf16": {
         "enabled": true
     },
