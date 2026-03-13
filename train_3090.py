@@ -541,6 +541,8 @@ def main():
         dataset_common_kwargs["short_target_mode"] = short_target_mode
     else:
         print("[Data] build_dataset_rank has no short_target_mode; using legacy behavior.")
+    if "strip_nemotron_math_prompt_prefix" in build_dataset_rank_params:
+        dataset_common_kwargs["strip_nemotron_math_prompt_prefix"] = data_cfg.get("strip_nemotron_math_prompt_prefix", False)
 
     traindataset = build_dataset_rank(
         tokenizer,

@@ -20,6 +20,7 @@ def build_dataset_rank(
     get_test_subset: bool = False,
     seed: int = 42,
     short_target_mode: str = "skip",  # "pad_eos", "skip", or "keep"
+    strip_nemotron_math_prompt_prefix: bool = False,
     train_subset_percents: Optional[str] = None,
     test_subset_percents: Optional[str] = None,
     train_subset_offsets: Optional[str] = None,
@@ -53,6 +54,10 @@ def build_dataset_rank(
 
     SEP = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     ROLES_OK = {"human", "user", "gpt", "assistant"}
+    NEMOTRON_MATH_PROMPT_PREFIX = (
+        "Solve the following math problem. Make sure to put the answer "
+        "(and only answer) inside \\boxed{}.\n\n"
+    )
 
     def _is_local_saved_dataset(p: str) -> bool:
         path = Path(p)
@@ -207,6 +212,22 @@ def build_dataset_rank(
         attention_mask = [1] * len(input_ids)
         return input_ids, target, attention_mask
 
+    def _normalize_gsm8k_answer(answer: str) -> str:
+        if not isinstance(answer, str):
+            return answer
+
+        normalized = re.sub(
+            r"\$?<<([^<>]+)>>([^\s]+)",
+            lambda m: f"{m.group(2)} \\({m.group(1)}\\)",
+            answer,
+        )
+        normalized = re.sub(
+            r"(?m)^####\s*(.+?)\s*$",
+            lambda m: rf"\boxed{{{m.group(1).strip()}}}",
+            normalized,
+        )
+        return normalized
+
     def _mmlu_answer_to_index(answer: Any, num_choices: int) -> Optional[int]:
         if answer is None:
             return None
@@ -255,7 +276,14 @@ def build_dataset_rank(
                 # messages = [{"role": "system", "content": SYSTEM_PROMPT}]
                 messages = []
                 for msg in source:
-                    messages.append({"role": msg["role"], "content": msg["content"]})
+                    content = msg["content"]
+                    if (
+                        strip_nemotron_math_prompt_prefix
+                        and isinstance(content, str)
+                        and content.startswith(NEMOTRON_MATH_PROMPT_PREFIX)
+                    ):
+                        content = content.removeprefix(NEMOTRON_MATH_PROMPT_PREFIX)
+                    messages.append({"role": msg["role"], "content": content})
                 messages.append({"role": "assistant", "content": response})
 
                 conversations.append(_apply_chat_template(messages))
@@ -287,7 +315,7 @@ def build_dataset_rank(
             data_pts = len(examples.get("question", []))
             for i in range(data_pts):
                 question = examples["question"][i]
-                answer = examples["answer"][i]
+                answer = _normalize_gsm8k_answer(examples["answer"][i])
                 if not question or not answer:
                     continue
                 # messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -538,7 +566,7 @@ def build_dataset_rank(
         tok_id = getattr(tokenizer, "name_or_path", "unknown_tokenizer")
         proc_key = _safe_dirname(
             f"{datapath}:{split}:req{requested_split}:{tok_id}:max{max_len}:tgt{target_len}:"
-            f"seed{seed}:short{short_target_mode}:tsr{test_split_ratio}:"
+            f"seed{seed}:short{short_target_mode}:stripnemo{int(strip_nemotron_math_prompt_prefix)}:tsr{test_split_ratio}:"
             f"trpct{train_pct_i if train_pct_i is not None else 'na'}:"
             f"tepct{test_pct_i if test_pct_i is not None else 'na'}:"
             f"troff{train_offset_i if train_offset_i is not None else 'na'}:"
