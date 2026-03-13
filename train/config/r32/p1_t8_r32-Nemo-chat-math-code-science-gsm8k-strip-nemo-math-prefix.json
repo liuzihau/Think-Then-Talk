@@ -8,8 +8,8 @@
         "train_subset_offsets": "0,0,0,0,0",
         "test_subset_offsets": "0,0,0,0,0",
         "short_target_mode": "keep",
-        "block_size": 4,
-        "block_num": 128,
+        "block_size": 8,
+        "block_num": 64,
         "strip_nemotron_math_prompt_prefix": true
     },
     "init_from_state_dir": "cfg6-p1-l30-r32-a64-lm-t4-mlp-7.5lr-4-128-2/state_3",
