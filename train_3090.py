@@ -8,7 +8,7 @@ Single-process, pure PyTorch training:
 - PyTorch-style checkpoint saving (talk_model + optimizer + scheduler + meta)
 """
 
-import os, re, json, inspect
+import os, re, json, inspect, subprocess, sys
 import argparse
 import math
 import numpy as np
@@ -17,6 +17,7 @@ from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from pathlib import Path
 from transformers import AutoTokenizer
 from accelerate.utils import set_seed
 from tqdm import tqdm
@@ -229,6 +230,112 @@ def append_jsonl(path: str, payload: dict):
         os.makedirs(parent, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def build_eval_model_args(ckpt_path: str, block_size: int, think_device1: str, think_device2: str, talk_device: str, eval_cfg: dict):
+    model_args = {
+        "ckpt_path": ckpt_path,
+        "gen_length": int(eval_cfg.get("gen_length", 512)),
+        "block_size": int(eval_cfg.get("block_size", block_size)),
+        "think_device1": str(eval_cfg.get("think_device1", think_device1)),
+        "think_device2": str(eval_cfg.get("think_device2", think_device2)),
+        "talk_device": str(eval_cfg.get("talk_device", talk_device)),
+        "show_speed": bool(eval_cfg.get("show_speed", True)),
+        "prompt_prefix": str(eval_cfg.get("prompt_prefix", "")),
+        "prompt_suffix": str(eval_cfg.get("prompt_suffix", "")),
+    }
+    return ",".join(f"{k}={v}" for k, v in model_args.items())
+
+
+def run_inference_suite(train_config: dict, savedir: str, state_dir: str, epoch: int, think_device1: str, think_device2: str, talk_device: str):
+    inference_cfg = train_config.get("inference", {})
+    if not inference_cfg.get("enabled", False):
+        return
+
+    every_n_epochs = int(inference_cfg.get("every_n_epochs", 1))
+    if every_n_epochs > 1 and ((epoch + 1) % every_n_epochs != 0):
+        print(f"[Inference] skip at epoch {epoch + 1}: every_n_epochs={every_n_epochs}")
+        return
+
+    evals = inference_cfg.get("evals", [])
+    if not isinstance(evals, list) or len(evals) == 0:
+        print("[Inference] enabled but no evals configured; skipping.")
+        return
+
+    script_dir = Path(__file__).resolve().parent
+    eval_script = script_dir / "eval_t3.py"
+    output_root = inference_cfg.get("output_root", "evals_results")
+    log_path = os.path.join(savedir, "logs", "inference_runs.jsonl")
+
+    for eval_cfg in evals:
+        if not eval_cfg.get("enabled", True):
+            continue
+
+        task = str(eval_cfg["task"])
+        num_fewshot = int(eval_cfg.get("num_fewshot", 0))
+        gen_length = int(eval_cfg.get("gen_length", 512))
+        batch_size = int(eval_cfg.get("batch_size", 1))
+        limit = eval_cfg.get("limit", None)
+        output_path = eval_cfg.get(
+            "output_path",
+            os.path.join(savedir, output_root, f"{task}-ns{num_fewshot}-gl{gen_length}"),
+        )
+
+        cmd = [
+            sys.executable,
+            str(eval_script),
+            "--model",
+            "t3_model",
+            "--model_args",
+            build_eval_model_args(
+                ckpt_path=state_dir,
+                block_size=train_config["data"]["block_size"],
+                think_device1=think_device1,
+                think_device2=think_device2,
+                talk_device=talk_device,
+                eval_cfg=eval_cfg,
+            ),
+            "--tasks",
+            task,
+            "--num_fewshot",
+            str(num_fewshot),
+            "--batch_size",
+            str(batch_size),
+            "--output_path",
+            output_path,
+        ]
+        if limit is not None and str(limit) != "":
+            cmd.extend(["--limit", str(limit)])
+        if eval_cfg.get("log_samples", False):
+            cmd.append("--log_samples")
+        if eval_cfg.get("confirm_run_unsafe_code", False):
+            cmd.append("--confirm_run_unsafe_code")
+
+        print(f"[Inference] epoch={epoch + 1} task={task} limit={limit} output_path={output_path}")
+        print("[Inference] cmd:", " ".join(cmd))
+        status = "ok"
+        error_msg = None
+        try:
+            subprocess.run(cmd, cwd=str(script_dir), check=True)
+        except subprocess.CalledProcessError as exc:
+            status = "failed"
+            error_msg = str(exc)
+            print(f"[Inference] task={task} failed: {exc}")
+            if inference_cfg.get("fail_on_error", False):
+                raise
+
+        append_jsonl(
+            log_path,
+            {
+                "epoch": int(epoch),
+                "state_dir": state_dir,
+                "task": task,
+                "output_path": output_path,
+                "limit": limit,
+                "status": status,
+                "error": error_msg,
+            },
+        )
 
 
 def find_max_state_with_file(directory, filename="ckpt.pt"):
@@ -1153,6 +1260,16 @@ def main():
                 "global_step": global_step,
             },
             model_config=model_config
+        )
+        state_dir = os.path.join(args.savedir, f"state_{epoch}")
+        run_inference_suite(
+            train_config=train_config,
+            savedir=args.savedir,
+            state_dir=state_dir,
+            epoch=epoch,
+            think_device1=THINK_DEVICE1,
+            think_device2=THINK_DEVICE2,
+            talk_device=TALK_DEVICE,
         )
 
     print("\nDone.")
