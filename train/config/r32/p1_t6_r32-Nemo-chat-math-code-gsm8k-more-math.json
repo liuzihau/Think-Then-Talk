@@ -9,7 +9,7 @@
         "test_subset_offsets": "0,0,0,0",
         "short_target_mode": "keep",
         "block_size": 6,
-        "block_num": 85
+        "block_num": 90
     },
     "init_from_state_dir": "cfg6-p1-l30-r32-a64-lm-t4-mlp-7.5lr-4-128-2/state_3",
     "bf16": {
@@ -86,14 +86,14 @@
             "weight_type": "manual",
             "manual_weights": [
                 0.1,
-                0.2,
-                0.4,
-                1.0,
+                0.1,
+                0.25,
+                0.25,
                 1.0,
                 1.0
             ],
             "base": 0.9,
-            "cap_step": 7,
+            "cap_step": 6,
             "min_weight": 0.0,
             "max_weight": 1000000000.0
         },
@@ -194,10 +194,10 @@
                 "num_fewshot": 0,
                 "gen_length": 512,
                 "batch_size": 1,
-                "limit": 20,
+                "limit": 100,
                 "show_speed": true,
                 "log_samples": false,
-                "prompt_prefix": "",
+                "prompt_prefix": "Solve the following math problem. Make sure to put the answer (and only answer) inside \\boxed{}.\n\n",
                 "prompt_suffix": ""
             },
             {

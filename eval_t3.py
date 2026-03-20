@@ -6,6 +6,7 @@ import os
 import json
 import time
 import random
+import re
 import torch
 
 import numpy as np
@@ -51,6 +52,8 @@ class T3EvalHarness(LM):
         talk_device="cuda:0",
         save_dir=None,
         show_speed=False,
+        prompt_prefix="",
+        prompt_suffix="",
         **kwargs,
     ):
         super().__init__()
@@ -64,6 +67,8 @@ class T3EvalHarness(LM):
         self.block_size = int(block_size)
         self.show_speed = show_speed
         self.save_dir = save_dir
+        self.prompt_prefix = prompt_prefix
+        self.prompt_suffix = prompt_suffix
 
         self.think_device1 = think_device1
         self.think_device2 = think_device2
@@ -105,6 +110,57 @@ class T3EvalHarness(LM):
 
         self._rank = 0
         self._world_size = 1
+
+    def _build_question(self, question):
+        return f"{self.prompt_prefix}{question}{self.prompt_suffix}"
+
+    def _is_humaneval_request(self, req):
+        task_id = None
+        if hasattr(req, "doc") and isinstance(req.doc, dict):
+            task_id = req.doc.get("task_id")
+        return isinstance(task_id, str) and task_id.lower().startswith("humaneval")
+
+    def _is_math_request(self, req):
+        task_name = getattr(req, "task_name", None)
+        if isinstance(task_name, str) and any(
+            token in task_name.lower() for token in ("hendrycks_math", "minerva_math")
+        ):
+            return True
+        if hasattr(req, "doc") and isinstance(req.doc, dict):
+            if {"problem", "solution", "answer"}.intersection(req.doc.keys()):
+                return True
+        return False
+
+    def _extract_last_boxed_answer(self, text):
+        boxed_matches = list(re.finditer(r"\\boxed\s*(\{)?", text))
+        if not boxed_matches:
+            return text
+
+        match = boxed_matches[-1]
+        start = match.end()
+        if match.group(1) == "{":
+            depth = 1
+            idx = start
+            while idx < len(text):
+                char = text[idx]
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:idx].strip()
+                idx += 1
+            return text[match.start():].strip()
+
+        line = text[start:].lstrip()
+        if not line:
+            return text
+        return line.splitlines()[0].strip()
+
+    def _prepare_generation_for_eval(self, req, gen_text):
+        if self._is_math_request(req):
+            return self._extract_last_boxed_answer(gen_text)
+        return gen_text
 
     @property
     def rank(self):
@@ -408,12 +464,13 @@ class T3EvalHarness(LM):
         output = [None] * len(requests)
         num_tokens = 0
         total_nfe = 0
+        processed_count = 0
 
         start_time = time.time()
         pbar = tqdm(total=len(requests), desc="Generating...")
 
         for req_idx, req in enumerate(requests):
-            question = req.args[0]
+            question = self._build_question(req.args[0])
             stop_tokens = req.args[1]["until"]
 
             m = [{"role": "user", "content": question}]
@@ -429,6 +486,7 @@ class T3EvalHarness(LM):
 
             generated, nfe = self.t3_generate(input_batch)
             total_nfe += nfe
+            processed_count += 1
 
             gen_ids = generated[0, prompt_len:]
             gen_text = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
@@ -438,19 +496,20 @@ class T3EvalHarness(LM):
                     gen_text = gen_text.split(stop_seq)[0]
 
             gen_ids_clean = self.tokenizer(gen_text)["input_ids"]
-            if self.show_speed:
-                num_tokens += sum(1 for t in gen_ids_clean if t != 126081)
-
             gen_text_clean = self.tokenizer.decode(
                 gen_ids_clean, skip_special_tokens=True
             )
-            output[req_idx] = gen_text_clean
 
-            if req_idx < 3 or req_idx % 100 == 0:
-                print("=" * 20)
-                print(f"[{req_idx}/{len(requests)}] answer:", gen_text_clean[:200])
-                print("nfe:", nfe)
-                print("=" * 20)
+            if self.show_speed:
+                num_tokens += sum(1 for t in gen_ids_clean if t != 126081)
+
+            output[req_idx] = self._prepare_generation_for_eval(req, gen_text_clean)
+
+            print("=" * 20)
+            print("answer: ", gen_text_clean)
+            print("nfe: ", nfe)
+            print("avg nfe: ", total_nfe / processed_count)
+            print("=" * 20, end="\n\n")
 
             pbar.update(1)
 
