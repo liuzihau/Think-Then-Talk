@@ -41,17 +41,11 @@ def build_dataset_rank(
       2) processed dataset cached to disk under cache_root/processed/<cache_key>/(train|test)
     """
 
+    import shutil
+
     # -----------------------------
     # Helpers
     # -----------------------------
-    # SYSTEM_PROMPT = (
-    #     "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  "
-    #     "Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. "
-    #     "Please ensure that your responses are socially unbiased and positive in nature.\n\n"
-    #     "If a question does not make any sense, or is not factually coherent, explain why instead of answering something "
-    #     "not correct. If you don't know the answer to a question, please don't share false information."
-    # )
-
     SEP = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     ROLES_OK = {"human", "user", "gpt", "assistant"}
     NEMOTRON_MATH_PROMPT_PREFIX = (
@@ -112,7 +106,6 @@ def build_dataset_rank(
         return out
 
     def _resolve_split(datapath: str, requested_split: str, use_test_split: bool) -> str:
-        # Keep backward compatibility: explicit split always wins.
         if requested_split != "auto":
             return requested_split
         repo_id, _ = _parse_hf_id(datapath)
@@ -129,8 +122,6 @@ def build_dataset_rank(
         return requested_split
 
     def _use_native_train_test_split(datapath: str, requested_split: str) -> bool:
-        # For datasets that already have canonical train/test (or test-only) splits,
-        # avoid applying an extra random train_test_split when using auto split.
         if requested_split != "auto":
             return False
         repo_id, _ = _parse_hf_id(datapath)
@@ -143,12 +134,10 @@ def build_dataset_rank(
         }
 
     def _ensure_pad_token():
-        # keep your behaviour: if pad token missing, use unk
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.unk_token_id
 
     def _apply_chat_template(messages: List[Dict[str, str]]) -> str:
-        # keep your behaviour: apply_chat_template + removesuffix(assistant header)
         return tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -159,21 +148,12 @@ def build_dataset_rank(
         _ensure_pad_token()
         ids = tokenizer(
             text,
-            return_tensors=None,          # return python lists
+            return_tensors=None,
             add_special_tokens=False,
         )["input_ids"]
-        # tokenizer can return list[int] for single string
         return ids
 
     def _build_prompt_and_target(conversation: str) -> Optional[Tuple[List[int], List[int], List[int]]]:
-        """
-        Convert a full conversation string (ending with an assistant answer)
-        into:
-          input_ids: prompt ids (up to assistant header)
-          target: assistant answer token ids
-          attention_mask: ones for prompt length
-        Returns None if filtered out.
-        """
         full_ids = _tokenize_ids(conversation)
 
         if len(full_ids) > max_len:
@@ -202,7 +182,6 @@ def build_dataset_rank(
                     eos_id = getattr(tokenizer, "unk_token_id", 0)
                 target = target + [int(eos_id)] * (target_len - len(target))
             elif short_target_mode == "keep":
-                # Keep short targets as-is. Collator handles padding for each batch.
                 pass
             else:
                 raise ValueError(
@@ -247,14 +226,23 @@ def build_dataset_rank(
                 return idx if 0 <= idx < num_choices else None
         return None
 
+    def _empty_processed_dataset():
+        empty_features = Features({
+            "input_ids": Sequence(Value("int64")),
+            "target": Sequence(Value("int64")),
+            "attention_mask": Sequence(Value("int64")),
+        })
+        ds_empty = Dataset.from_dict(
+            {"input_ids": [], "target": [], "attention_mask": []},
+            features=empty_features,
+        )
+        ds_empty.set_format(type="torch")
+        return ds_empty
+
     # -----------------------------
-    # Dataset-specific “adapters”
+    # Dataset-specific adapters
     # -----------------------------
     def _iter_conversations_from_batch(datapath: str, examples: Dict) -> List[str]:
-        """
-        Produce a list of conversation strings to be turned into (prompt, target).
-        Each string is a full conversation that includes the assistant answer at the end.
-        """
         conversations: List[str] = []
 
         repo_id, _ = _parse_hf_id(datapath)
@@ -266,14 +254,12 @@ def build_dataset_rank(
                 response = examples["output"][i]
 
                 if not source or source[0].get("role") not in ROLES_OK:
-                    # keep your debug print behaviour, but avoid crashing
                     try:
                         print(source[0].get("role"))
                     except Exception:
                         print("bad_source_role")
                     continue
 
-                # messages = [{"role": "system", "content": SYSTEM_PROMPT}]
                 messages = []
                 for msg in source:
                     content = msg["content"]
@@ -297,13 +283,11 @@ def build_dataset_rank(
                 if not source:
                     continue
 
-                # messages = [{"role": "system", "content": SYSTEM_PROMPT}]
                 messages = []
                 if source[0].get("role") == "system":
-                    messages[0] = source[0]
+                    messages = [source[0]]
                     source = source[1:]
 
-                # Create a training instance at every assistant turn (same as your original)
                 for msg in source:
                     messages.append({"role": msg["role"], "content": msg["content"]})
                     if msg.get("role") == "assistant":
@@ -318,7 +302,7 @@ def build_dataset_rank(
                 answer = _normalize_gsm8k_answer(examples["answer"][i])
                 if not question or not answer:
                     continue
-                # messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
                 messages = []
                 messages.append({"role": "user", "content": question})
                 messages.append({"role": "assistant", "content": answer})
@@ -339,7 +323,6 @@ def build_dataset_rank(
                     "Complete the following Python function.\n\n"
                     f"{prompt}"
                 )
-                # messages = [{"role": "system", "content": SYSTEM_PROMPT}]
                 messages = []
                 messages.append({"role": "user", "content": user_prompt})
                 messages.append({"role": "assistant", "content": solution})
@@ -376,7 +359,6 @@ def build_dataset_rank(
                 answer_text = choices[answer_idx]
                 assistant = f"The correct answer is {answer_label}. {answer_text}"
 
-                # messages = [{"role": "system", "content": SYSTEM_PROMPT}]
                 messages = []
                 messages.append({"role": "user", "content": user_prompt})
                 messages.append({"role": "assistant", "content": assistant})
@@ -387,10 +369,6 @@ def build_dataset_rank(
         raise ValueError(f"Unsupported datapath for preprocessing: {datapath}")
 
     def _make_preprocess_fn(datapath: str) -> Callable[[Dict], Dict]:
-        """
-        Returns a batched map function producing exactly:
-          input_ids, target, attention_mask (lists, not tensors)
-        """
         def _fn(examples: Dict) -> Dict:
             new_examples = {"attention_mask": [], "target": [], "input_ids": []}
 
@@ -452,7 +430,7 @@ def build_dataset_rank(
     for i_path, (datapath, requested_split) in enumerate(zip(paths, all_splits)):
         split = _resolve_split(datapath, requested_split, get_test_subset)
 
-        # 1) Load raw dataset (from disk or HF and cache)
+        # 1) Load raw dataset
         if _is_local_saved_dataset(datapath):
             ds = load_from_disk(datapath)
         else:
@@ -473,7 +451,7 @@ def build_dataset_rank(
                 ds_hf.save_to_disk(str(raw_local_path))
                 ds = load_from_disk(str(raw_local_path))
 
-        # 2) Shuffle then split (same logic)
+        # 2) Shuffle then split
         ds = ds.shuffle(seed=seed)
 
         use_native_split = _use_native_train_test_split(datapath, requested_split)
@@ -481,10 +459,10 @@ def build_dataset_rank(
         test_pct_i = test_pcts[i_path] if use_explicit_subset_percents else None
         train_offset_i = train_offsets[i_path] if use_explicit_subset_percents else None
         test_offset_i = test_offsets[i_path] if use_explicit_subset_percents else None
+
         if use_explicit_subset_percents:
             n_total = len(ds)
             if use_native_split:
-                # Native train/test datasets are already disjoint by split.
                 pct = float(test_pct_i if get_test_subset else train_pct_i)
                 offset = float(test_offset_i if get_test_subset else train_offset_i)
                 if offset + pct > 100.0 + 1e-9:
@@ -501,7 +479,6 @@ def build_dataset_rank(
                     f"taking {pct:.3f}% from offset {offset:.3f}% => {len(ds1)}/{n_total}"
                 )
             else:
-                # Same source split for both train/test; enforce disjoint partitions.
                 trp = float(train_pct_i)
                 tep = float(test_pct_i)
                 tro = float(train_offset_i)
@@ -543,8 +520,8 @@ def build_dataset_rank(
                         f"(after reserving {tep:.3f}% for test)"
                     )
         elif test_split_ratio > 0 and len(ds) > 1 and not use_native_split:
-            splits = ds.train_test_split(test_size=test_split_ratio, seed=seed)
-            ds1 = splits["test"] if get_test_subset else splits["train"]
+            split_dict = ds.train_test_split(test_size=test_split_ratio, seed=seed)
+            ds1 = split_dict["test"] if get_test_subset else split_dict["train"]
             print(
                 f"dataset rank: returning {'TEST' if get_test_subset else 'TRAIN'} split ({len(ds1)} examples)"
             )
@@ -557,9 +534,21 @@ def build_dataset_rank(
             else:
                 print(f"dataset rank: returning FULL dataset ({len(ds1)} examples)")
 
+        print(f"[DEBUG] datapath={datapath} get_test_subset={get_test_subset} len(ds1)={len(ds1)}")
+
+        # IMPORTANT FIX:
+        # handle empty split BEFORE any processed cache load
+        if len(ds1) == 0:
+            ds1_proc = _empty_processed_dataset()
+            if final_ds is None:
+                final_ds = ds1_proc
+            else:
+                final_ds = concatenate_datasets([final_ds, ds1_proc])
+            continue
+
         original_columns = ds1.column_names
 
-        # 3) Processed caching (IMPORTANT: include tokenizer identity)
+        # 3) Processed caching
         processed_root = cache_root / "processed"
         processed_root.mkdir(parents=True, exist_ok=True)
 
@@ -570,48 +559,44 @@ def build_dataset_rank(
             f"trpct{train_pct_i if train_pct_i is not None else 'na'}:"
             f"tepct{test_pct_i if test_pct_i is not None else 'na'}:"
             f"troff{train_offset_i if train_offset_i is not None else 'na'}:"
-            f"teoff{test_offset_i if test_offset_i is not None else 'na'}:v4"
+            f"teoff{test_offset_i if test_offset_i is not None else 'na'}:v5"
         )
         processed_path = processed_root / proc_key / ("test" if get_test_subset else "train")
         print(processed_path)
 
+        ds1_proc = None
         if _is_local_saved_dataset(str(processed_path)):
-            ds1_proc = load_from_disk(str(processed_path))
-        else:
-            if len(ds1) == 0:
-                # Empty splits cannot infer schema via map/save_to_disk, so build
-                # a typed empty dataset matching normal preprocess output.
-                empty_features = Features({
-                    "input_ids": Sequence(Value("int64")),
-                    "target": Sequence(Value("int64")),
-                    "attention_mask": Sequence(Value("int64")),
-                })
-                ds1_proc = Dataset.from_dict(
-                    {"input_ids": [], "target": [], "attention_mask": []},
-                    features=empty_features,
-                )
-            else:
-                preprocess_fn = _make_preprocess_fn(datapath)
-                ds1_proc = ds1.map(
-                    preprocess_fn,
-                    batched=True,
-                    num_proc=num_proc,
-                    remove_columns=original_columns,
-                    load_from_cache_file=False,  # keep your behaviour: rely on save_to_disk instead
-                )
+            try:
+                ds1_proc = load_from_disk(str(processed_path))
+            except Exception as e:
+                print(f"[WARN] Failed to load processed dataset cache at {processed_path}: {e}")
+                print("[WARN] Removing broken cache and rebuilding...")
+                shutil.rmtree(processed_path, ignore_errors=True)
+                ds1_proc = None
+
+        if ds1_proc is None:
+            preprocess_fn = _make_preprocess_fn(datapath)
+            ds1_proc = ds1.map(
+                preprocess_fn,
+                batched=True,
+                num_proc=num_proc,
+                remove_columns=original_columns,
+                load_from_cache_file=False,
+            )
             ds1_proc.save_to_disk(str(processed_path))
 
-        # 4) Output format unchanged
         ds1_proc.set_format(type="torch")
 
-        # 5) Concat across datapaths
         if final_ds is None:
             final_ds = ds1_proc
         else:
             final_ds = concatenate_datasets([final_ds, ds1_proc])
 
-    return final_ds
+    if final_ds is None:
+        final_ds = _empty_processed_dataset()
 
+    final_ds.set_format(type="torch")
+    return final_ds
 
 class DataCollatorWithPadding:
 
