@@ -672,7 +672,7 @@ def main():
     train_loader = DataLoader(
         traindataset,
         batch_size=training_parameters["bs"],
-        num_workers=1,
+        num_workers=0,
         shuffle=True,
         pin_memory=True,
         collate_fn=DataCollatorWithPaddingV2(block_size=train_config["data"]["block_size"], block_num=train_config["data"]["block_num"])
@@ -680,7 +680,7 @@ def main():
     test_loader = DataLoader(
         testdataset,
         batch_size=training_parameters["bs"],
-        num_workers=1,
+        num_workers=0,
         pin_memory=True,
         collate_fn=DataCollatorWithPaddingV2(block_size=train_config["data"]["block_size"], block_num=train_config["data"]["block_num"])
     )
