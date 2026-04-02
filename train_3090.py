@@ -112,11 +112,13 @@ def build_step_weights(loss_cfg: dict, num_steps: int, epoch: int):
             manual_w = step_agg.get("manual_weights", [])
             if not isinstance(manual_w, list) or len(manual_w) == 0:
                 raise ValueError("step_agg.manual_weights must be a non-empty list when weight_type='manual'")
-            if len(manual_w) != num_steps:
+            if len(manual_w) < num_steps:
                 raise ValueError(
-                    f"manual_weights length ({len(manual_w)}) must match num_steps ({num_steps})"
+                    f"manual_weights length ({len(manual_w)}) must be at least num_steps ({num_steps})"
                 )
-            w = torch.tensor([float(x) for x in manual_w], dtype=torch.float32)
+            # Training can finish in fewer denoise iterations than the configured maximum
+            # once every target position has been revealed, so we only use the executed prefix.
+            w = torch.tensor([float(x) for x in manual_w[:num_steps]], dtype=torch.float32)
         elif weight_type == "uniform":
             w = torch.ones(num_steps, dtype=torch.float32)
         else:
@@ -233,6 +235,24 @@ def selected_position_loss_acc(
     sel_loss = (-sel_logp)[valid]
 
     return float(sel_loss.mean().item()), float(sel_acc.mean().item())
+
+def masked_position_loss_acc(
+    logits: torch.Tensor,         # [BG, L, V]
+    target: torch.Tensor,         # [BG, L]
+    position_mask: torch.Tensor,  # [BG, L]
+):
+    """
+    Compute token NLL and accuracy over an arbitrary subset of positions.
+    """
+    m = position_mask.bool()
+    if not m.any():
+        return 0.0, 0.0
+
+    target_logp = F.log_softmax(logits, dim=-1).gather(2, target.unsqueeze(-1)).squeeze(-1)
+    pred = logits.argmax(dim=-1)
+    loss = (-(target_logp[m])).mean().item()
+    acc = (pred[m] == target[m]).float().mean().item()
+    return float(loss), float(acc)
 
 def append_jsonl(path: str, payload: dict):
     parent = os.path.dirname(path)
@@ -904,18 +924,6 @@ def main():
                     denoise_cfg = train_config["denoise"]
                     reveal_cfg = get_denoise_reveal_config(denoise_cfg)
                     decode_cfg = get_denoise_decode_config(denoise_cfg, default_k=reveal_cfg["k"])
-                    decode_metric_mode = get_policy_label(reveal_cfg.get("policy"), "greedy")
-                    decode_cols, decode_valid = pick_single_position(
-                        loss_mask=loss_mask,
-                        logits=logits,
-                        mode=decode_metric_mode,
-                    )
-                    decode_loss_i, decode_acc_i = selected_position_loss_acc(
-                        logits=logits,
-                        target=target_talk,
-                        cols=decode_cols,
-                        valid=decode_valid,
-                    )
 
                     # plosses.append(loss_i)
                     loss_sums.append(loss_sum_i)
@@ -923,14 +931,13 @@ def main():
                     acces.append(correct / max(1, total))
                     certain_losses.append(certain_loss_i)
                     certain_accs.append(certain_acc_i)
-                    decode_losses.append(decode_loss_i)
-                    decode_accs.append(decode_acc_i)
                     
                     if do_vis and idx < VIS_MAX_STEPS:
                         steps_pred_BG_L.append(logits.argmax(dim=-1).detach())  # [B*G, L]
                         steps_mask_BG_L.append(loss_mask.detach())             # [B*G, L]
                     
                     # denoise step updates input_ids + loss_mask (both on TALK_DEVICE)
+                    loss_mask_prev = loss_mask
                     if train_config["soft_inputs"]["enabled"]:
                         soft_cfg = train_config["soft_inputs"]
                         kwargs = dict(
@@ -966,6 +973,15 @@ def main():
                             decode_cfg=decode_cfg,
                         )
                         input_embeds = F.embedding(input_ids, model.talk_embed_weight)  # initial emb (step 0)
+
+                    revealed_mask = loss_mask_prev.bool() & (~loss_mask.bool())
+                    decode_loss_i, decode_acc_i = masked_position_loss_acc(
+                        logits=logits,
+                        target=target_talk,
+                        position_mask=revealed_mask,
+                    )
+                    decode_losses.append(decode_loss_i)
+                    decode_accs.append(decode_acc_i)
                     
                     if train_config["detach_recurrence"]["enabled"] and ((idx + 1) % train_config["detach_recurrence"]["every_r_steps"] == 0):
                         rps, input_embeds = detach_state(rps, input_embeds)
