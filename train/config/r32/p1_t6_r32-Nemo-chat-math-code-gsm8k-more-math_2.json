@@ -11,7 +11,7 @@
         "block_size": 6,
         "block_num": 90
     },
-    "init_from_state_dir": "cfg6-p1-l30-r32-a64-lm-t4-mlp-7.5lr-4-128-2/state_3",
+    "init_from_state_dir": "cfg6-p1-l30-r32-a64-lm-t4-mlp-7.5lr-6-90-2/state_2",
     "bf16": {
         "enabled": true
     },
@@ -69,7 +69,7 @@
     "train_micro_batch_size_per_gpu": 1,
     "wall_clock_breakdown": false,
     "training_parameters": {
-        "wandb_name": "cfg6-p1-l30-r32-a64-lm-t6-mlp-7.5lr",
+        "wandb_name": "cfg6-p1-l30-r32-a64-lm-t6-mlp-7.5lr-2",
         "bs": 4,
         "num_epochs": 4,
         "num_workers": 2,
@@ -85,10 +85,10 @@
             "enabled": true,
             "weight_type": "manual",
             "manual_weights": [
-                0.1,
-                0.1,
-                0.25,
-                0.25,
+                0.2,
+                0.2,
+                0.2,
+                0.2,
                 1.0,
                 1.0
             ],
@@ -180,7 +180,7 @@
     },
     "detach_recurrence": {
         "enabled": true,
-        "every_r_steps": 2
+        "every_r_steps": 1
     },
     "inference": {
         "enabled": true,
