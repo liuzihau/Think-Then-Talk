@@ -1,7 +1,7 @@
 import os, json, math
 import torch
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
@@ -119,6 +119,192 @@ def load_ckpt(state_dir, model, optimizer=None, scheduler=None, map_location="cp
     print(f"[CKPT] loaded: {ckpt_path}  -> start_epoch={start_epoch}")
     return start_epoch
 
+
+def _sample_policy_mode(
+    policy: Any,
+    *,
+    device: torch.device,
+    generator=None,
+    default_mode: str,
+) -> str:
+    if policy is None:
+        return default_mode
+    if isinstance(policy, str):
+        return policy
+    if not isinstance(policy, dict):
+        raise ValueError(f"Unsupported policy type: {type(policy)}")
+
+    policy_type = str(policy.get("type", "fixed"))
+    if policy_type in {"fixed", "single"}:
+        mode = policy.get("value", policy.get("mode", policy.get("name", default_mode)))
+        return str(mode)
+    if policy_type != "mixture":
+        raise ValueError(f"Unsupported policy type: {policy_type}")
+
+    choices = policy.get("choices", {})
+    if not isinstance(choices, dict) or not choices:
+        raise ValueError("Mixture policy requires a non-empty 'choices' dict.")
+
+    names = []
+    weights = []
+    for name, weight in choices.items():
+        w = float(weight)
+        if w < 0:
+            raise ValueError(f"Mixture weight must be non-negative, got {w} for {name}")
+        if w == 0:
+            continue
+        names.append(str(name))
+        weights.append(w)
+
+    if not names:
+        raise ValueError("Mixture policy has no positive-probability choices.")
+
+    weights_t = torch.tensor(weights, dtype=torch.float32, device=device)
+    choice_idx = torch.multinomial(weights_t, num_samples=1, generator=generator).item()
+    return names[choice_idx]
+
+
+def get_policy_label(policy: Any, default_mode: str) -> str:
+    if policy is None:
+        return default_mode
+    if isinstance(policy, str):
+        return policy
+    if isinstance(policy, dict):
+        policy_type = str(policy.get("type", "fixed"))
+        if policy_type in {"fixed", "single"}:
+            return str(policy.get("value", policy.get("mode", policy.get("name", default_mode))))
+        if policy_type == "mixture":
+            choices = policy.get("choices", {})
+            if isinstance(choices, dict) and choices:
+                return max(choices.items(), key=lambda kv: float(kv[1]))[0]
+    return default_mode
+
+
+def get_denoise_reveal_config(denoise_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    denoise_cfg = denoise_cfg or {}
+    reveal = denoise_cfg.get("reveal", {})
+    reveal = dict(reveal) if isinstance(reveal, dict) else {}
+
+    reveal["k"] = int(reveal.get("k", denoise_cfg.get("reveal_k", 1)))
+    reveal["policy"] = reveal.get("policy", denoise_cfg.get("reveal_strategy", "random"))
+    return reveal
+
+
+def get_denoise_decode_config(
+    denoise_cfg: Optional[Dict[str, Any]],
+    *,
+    default_k: int,
+) -> Dict[str, Any]:
+    denoise_cfg = denoise_cfg or {}
+    decode = denoise_cfg.get("decode", {})
+    decode = dict(decode) if isinstance(decode, dict) else {}
+
+    decode["policy"] = decode.get("policy", "fix")
+    decode["fix_k"] = int(decode.get("fix_k", default_k))
+    decode["max_k"] = int(decode.get("max_k", decode["fix_k"]))
+    decode["min_k"] = int(decode.get("min_k", 1))
+    decode["confidence_threshold"] = float(
+        decode.get("confidence_threshold", decode.get("threshold", 0.0))
+    )
+    return decode
+
+
+def _build_reveal_scores(
+    loss_mask: torch.Tensor,
+    logits: Optional[torch.Tensor],
+    *,
+    mode: str,
+    generator=None,
+) -> torch.Tensor:
+    device = loss_mask.device
+    BG, L = loss_mask.shape
+    active = loss_mask.bool()
+
+    if mode == "random":
+        if generator is not None:
+            scores = torch.rand((BG, L), device=device, generator=generator)
+        else:
+            scores = torch.rand((BG, L), device=device)
+    elif mode == "greedy":
+        if logits is None:
+            raise ValueError("mode='greedy' requires logits.")
+        scores = logits.max(dim=-1).values
+    elif mode == "ar_force":
+        pos = torch.arange(L, device=device).unsqueeze(0).expand(BG, L)
+        scores = (-pos).to(torch.float32)
+    else:
+        raise ValueError(f"Unknown reveal mode: {mode}")
+
+    return scores.masked_fill(~active, float("-inf"))
+
+
+def resolve_denoise_positions(
+    loss_mask: torch.Tensor,
+    logits: Optional[torch.Tensor],
+    *,
+    reveal_cfg: Optional[Dict[str, Any]] = None,
+    decode_cfg: Optional[Dict[str, Any]] = None,
+    generator=None,
+) -> Tuple[torch.Tensor, torch.Tensor, str, str]:
+    device = loss_mask.device
+    BG, L = loss_mask.shape
+    active = loss_mask.bool()
+    active_counts = active.sum(dim=1)
+
+    reveal_cfg = dict(reveal_cfg or {})
+    decode_cfg = dict(decode_cfg or {})
+
+    reveal_k = int(reveal_cfg.get("k", 1))
+    decode_fix_k = int(decode_cfg.get("fix_k", reveal_k))
+    decode_max_k = int(decode_cfg.get("max_k", decode_fix_k))
+    decode_min_k = int(decode_cfg.get("min_k", 1))
+    candidate_k = max(1, min(L, max(reveal_k, decode_fix_k, decode_max_k)))
+
+    reveal_mode = _sample_policy_mode(
+        reveal_cfg.get("policy"),
+        device=device,
+        generator=generator,
+        default_mode="random",
+    )
+    decode_mode = _sample_policy_mode(
+        decode_cfg.get("policy"),
+        device=device,
+        generator=generator,
+        default_mode="fix",
+    )
+
+    scores = _build_reveal_scores(
+        loss_mask=loss_mask,
+        logits=logits,
+        mode=reveal_mode,
+        generator=generator,
+    )
+    idx = scores.topk(k=candidate_k, dim=1).indices
+    chosen_active = active.gather(1, idx)
+
+    if decode_mode == "fix":
+        reveal_counts = torch.full((BG,), decode_fix_k, dtype=torch.long, device=device)
+    elif decode_mode in {"greedy", "greedy_threshold", "confidence_threshold"}:
+        if logits is None:
+            raise ValueError(f"decode mode '{decode_mode}' requires logits.")
+        conf = F.softmax(logits, dim=-1).amax(dim=-1)
+        threshold = float(decode_cfg.get("confidence_threshold", 0.0))
+        above = (conf > threshold) & active
+        reveal_counts = above.sum(dim=1).to(torch.long)
+        reveal_counts = reveal_counts.clamp(max=decode_max_k)
+        reveal_counts = torch.where(
+            active_counts > 0,
+            torch.maximum(reveal_counts, torch.full_like(reveal_counts, decode_min_k)),
+            reveal_counts,
+        )
+    else:
+        raise ValueError(f"Unknown decode mode: {decode_mode}")
+
+    reveal_counts = torch.minimum(reveal_counts, active_counts.to(torch.long))
+    rank = torch.arange(candidate_k, device=device).unsqueeze(0).expand(BG, candidate_k)
+    chosen_active = chosen_active & (rank < reveal_counts.unsqueeze(1))
+    return idx, chosen_active, reveal_mode, decode_mode
+
 @torch.no_grad()
 def apply_repetition_penalty_3d(
     logits: torch.Tensor,          # [BG, L, V]
@@ -221,50 +407,76 @@ def select_reveal_positions(
     loss_mask: torch.Tensor,          # [BG, L] 1=masked(active), 0=already revealed
     logits: Optional[torch.Tensor],    # [BG, L, V] (required for greedy)
     k_reveal: int = 1,
-    mode: str = "random",             # "random" | "greedy" | "ar_force"
+    mode: Any = "random",             # "random" | "greedy" | "ar_force" | mixture policy
+    decode_cfg: Optional[Dict[str, Any]] = None,
     generator=None,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, str, str]:
     """
     Returns:
-      idx: [BG, k] indices to reveal for each row (may include inactive positions if row has <k active)
+      idx: [BG, k] candidate indices to reveal for each row
+      chosen_active: [BG, k] bool mask indicating which candidates are actually selected
+      reveal_mode: sampled reveal policy used for this step
+      decode_mode: sampled decode policy used for this step
     """
     device = loss_mask.device
-    BG, L = loss_mask.shape
-    active = loss_mask.bool()
-
-    k = min(k_reveal, L)
+    BG, _ = loss_mask.shape
+    k = max(int(k_reveal), 0)
     if k <= 0:
-        return torch.empty((BG, 0), dtype=torch.long, device=device)
+        empty = torch.empty((BG, 0), dtype=torch.long, device=device)
+        empty_mask = torch.zeros((BG, 0), dtype=torch.bool, device=device)
+        return empty, empty_mask, get_policy_label(mode, "random"), get_policy_label(
+            None if decode_cfg is None else decode_cfg.get("policy"),
+            "fix",
+        )
 
-    if mode == "random":
-        if generator is not None:
-            scores = torch.rand((BG, L), device=device, generator=generator)
-        else:
-            scores = torch.rand((BG, L), device=device)
-        scores = scores.masked_fill(~active, float("-inf"))
-        idx = scores.topk(k=k, dim=1).indices  # [BG, k]
-        return idx
+    reveal_cfg = {"k": k, "policy": mode}
+    decode_cfg = dict(decode_cfg or {})
+    decode_cfg["fix_k"] = int(decode_cfg.get("fix_k", k))
+    decode_cfg["max_k"] = int(decode_cfg.get("max_k", decode_cfg["fix_k"]))
 
-    if mode == "greedy":
-        if logits is None:
-            raise ValueError("mode='greedy' requires logits.")
-        # confidence = max prob (or max logit) at each position
-        # using max logit is fine because monotonic with softmax
-        conf = logits.max(dim=-1).values  # [BG, L]
-        conf = conf.masked_fill(~active, float("-inf"))
-        idx = conf.topk(k=k, dim=1).indices
-        return idx
+    return resolve_denoise_positions(
+        loss_mask=loss_mask,
+        logits=logits,
+        reveal_cfg=reveal_cfg,
+        decode_cfg=decode_cfg,
+        generator=generator,
+    )
 
-    if mode == "ar_force":
-        # reveal left-to-right masked positions (like AR order inside the block)
-        # score = -position_index for active, so topk picks smallest indices
-        pos = torch.arange(L, device=device).unsqueeze(0).expand(BG, L)  # [BG, L]
-        scores = (-pos).to(torch.float32)
-        scores = scores.masked_fill(~active, float("-inf"))
-        idx = scores.topk(k=k, dim=1).indices
-        return idx
 
-    raise ValueError(f"Unknown mode: {mode}")
+def denoise_k_step_hard(
+    input_ids: torch.Tensor,
+    target: Optional[torch.Tensor],
+    loss_mask: torch.Tensor,
+    logits: torch.Tensor,
+    *,
+    reveal_cfg: Dict[str, Any],
+    decode_cfg: Dict[str, Any],
+    generator=None,
+) -> Tuple[torch.Tensor, torch.Tensor, str, str]:
+    device = input_ids.device
+    BG = input_ids.size(0)
+
+    idx, chosen_active, reveal_mode, decode_mode = resolve_denoise_positions(
+        loss_mask=loss_mask,
+        logits=logits,
+        reveal_cfg=reveal_cfg,
+        decode_cfg=decode_cfg,
+        generator=generator,
+    )
+
+    rows = torch.arange(BG, device=device).unsqueeze(1).expand_as(idx)
+    rows = rows[chosen_active]
+    cols = idx[chosen_active]
+
+    input_ids_next = input_ids.clone()
+    loss_mask_next = loss_mask.clone()
+    fill_ids = logits.argmax(dim=-1) if target is None else target
+
+    if rows.numel() > 0:
+        input_ids_next[rows, cols] = fill_ids[rows, cols]
+        loss_mask_next[rows, cols] = 0
+
+    return input_ids_next, loss_mask_next, reveal_mode, decode_mode
 
 
 # ---------------------------------------------------------
@@ -280,7 +492,8 @@ def denoise_k_step_soft_embed_v2(
     k_reveal: int = 1,
     soft_topk: int = 32,
     soft_temp: float = 1.0,
-    mode: str = "random",
+    mode: Any = "random",
+    decode_cfg: Optional[Dict[str, Any]] = None,
     generator=None,
     return_pred_ids: bool = False,
     top_p: float = 0.9,
@@ -309,16 +522,14 @@ def denoise_k_step_soft_embed_v2(
     logits_used = logits_adj if logits_adj is not None else logits
 
     # 1) Pick positions to reveal
-    idx = select_reveal_positions(
+    idx, chosen_active, _, _ = select_reveal_positions(
         loss_mask=loss_mask,
         logits=logits_used,
         k_reveal=k_reveal,
         mode=mode,
+        decode_cfg=decode_cfg,
         generator=generator,
-    )  # [BG, k]
-
-    active = loss_mask.bool()
-    chosen_active = active.gather(1, idx)  # [BG, k]
+    )
     rows = torch.arange(BG, device=device).unsqueeze(1).expand_as(idx)
     rows = rows[chosen_active]
     cols = idx[chosen_active]

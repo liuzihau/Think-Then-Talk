@@ -25,7 +25,17 @@ from tqdm import tqdm
 from model.modeling_t3 import T3Model
 from train.data_process import build_dataset_rank, DataCollatorWithPadding, DataCollatorWithPaddingV2
 from train.visualize import visualize_t3_batch_trace
-from utils import AttrDict, load_ckpt, save_ckpt, topk_soft_embedding_from_logits, denoise_k_step_soft_embed_v2
+from utils import (
+    AttrDict,
+    denoise_k_step_hard,
+    denoise_k_step_soft_embed_v2,
+    get_denoise_decode_config,
+    get_denoise_reveal_config,
+    get_policy_label,
+    load_ckpt,
+    save_ckpt,
+    topk_soft_embedding_from_logits,
+)
 
 
 # -----------------------------
@@ -394,46 +404,31 @@ def resolve_state_dir(path: str | None, filename: str = "ckpt.pt"):
     return None
 
 
-def denoise_k_step(input_ids, target, loss_mask, logits=None, k=1, mode="random", generator=None):
+def denoise_k_step(
+    input_ids,
+    target,
+    loss_mask,
+    logits=None,
+    k=1,
+    mode="random",
+    decode_cfg=None,
+    generator=None,
+):
     """
     input_ids: [BG, L] on TALK_DEVICE
     target:    [BG, L] on TALK_DEVICE
     loss_mask: [BG, L] on TALK_DEVICE (0/1 float or bool)
     """
-    device = input_ids.device
-    B, C = input_ids.shape
-
-    active = loss_mask.bool()
-    if mode == "ar_force":
-        pos = torch.arange(C, device=device).unsqueeze(0).expand(B, C)
-        scores = (-pos).to(torch.float32)
-    elif mode == "greedy":
-        if logits is None:
-            raise ValueError("mode='greedy' requires logits")
-        scores = logits.max(dim=-1).values
-    elif mode == "random":
-        if generator is not None:
-            assert generator.device == device
-            scores = torch.rand((B, C), device=device, generator=generator)
-        else:
-            scores = torch.rand((B, C), device=device)
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-    scores = scores.masked_fill(~active, float("-inf"))
-
-    idx = scores.topk(k=max(1, min(k, C)), dim=1).indices  # [B, k]
-    chosen_active = active.gather(1, idx)          # [B, k]
-
-    rows = torch.arange(B, device=device).unsqueeze(1).expand_as(idx)
-    input_ids = input_ids.clone()
-    loss_mask = loss_mask.clone()
-
-    rows = rows[chosen_active]
-    cols = idx[chosen_active]
-
-    input_ids[rows, cols] = target[rows, cols]
-    loss_mask[rows, cols] = 0
-
+    reveal_cfg = {"k": int(k), "policy": mode}
+    input_ids, loss_mask, _, _ = denoise_k_step_hard(
+        input_ids=input_ids,
+        target=target,
+        loss_mask=loss_mask,
+        logits=logits,
+        reveal_cfg=reveal_cfg,
+        decode_cfg=decode_cfg or {"policy": "fix", "fix_k": int(k)},
+        generator=generator,
+    )
     return input_ids, loss_mask
 
 
@@ -904,10 +899,14 @@ def main():
                         cols=certain_cols,
                         valid=certain_valid,
                     )
+                    denoise_cfg = train_config["denoise"]
+                    reveal_cfg = get_denoise_reveal_config(denoise_cfg)
+                    decode_cfg = get_denoise_decode_config(denoise_cfg, default_k=reveal_cfg["k"])
+                    decode_metric_mode = get_policy_label(reveal_cfg.get("policy"), "greedy")
                     decode_cols, decode_valid = pick_single_position(
                         loss_mask=loss_mask,
                         logits=logits,
-                        mode=train_config["denoise"]["reveal_strategy"],
+                        mode=decode_metric_mode,
                     )
                     decode_loss_i, decode_acc_i = selected_position_loss_acc(
                         logits=logits,
@@ -930,8 +929,6 @@ def main():
                         steps_mask_BG_L.append(loss_mask.detach())             # [B*G, L]
                     
                     # denoise step updates input_ids + loss_mask (both on TALK_DEVICE)
-                    reveal_k = int(train_config["denoise"].get("reveal_k", 1))
-                    reveal_mode = str(train_config["denoise"].get("reveal_strategy", "random"))
                     if train_config["soft_inputs"]["enabled"]:
                         soft_cfg = train_config["soft_inputs"]
                         kwargs = dict(
@@ -940,10 +937,11 @@ def main():
                             loss_mask=loss_mask,
                             logits=logits,
                             emb_weight=model.talk_embed_weight,
-                            k_reveal=reveal_k,
+                            k_reveal=reveal_cfg["k"],
                             soft_topk=soft_cfg["top_k"],
                             soft_temp=soft_cfg["temperature"],
-                            mode=reveal_mode,
+                            mode=reveal_cfg.get("policy", "random"),
+                            decode_cfg=decode_cfg,
                         )
                         # Only enable mask-mix when user explicitly sets lam_max/lam_min in config
                         if ("lam_max" in soft_cfg) or ("lam_min" in soft_cfg):
@@ -961,8 +959,9 @@ def main():
                             target=target_talk,
                             loss_mask=loss_mask,
                             logits=logits,
-                            k=reveal_k,
-                            mode=reveal_mode,
+                            k=reveal_cfg["k"],
+                            mode=reveal_cfg.get("policy", "random"),
+                            decode_cfg=decode_cfg,
                         )
                         input_embeds = F.embedding(input_ids, model.talk_embed_weight)  # initial emb (step 0)
                     
@@ -1103,7 +1102,10 @@ def main():
                             "clip_rate": batch_clip_rate,
                             "grad_norm_preclip": batch_grad_pre_mean,
                             "grad_norm_postclip": batch_grad_post_mean,
-                            "decode_mode": str(train_config["denoise"]["reveal_strategy"]),
+                            "decode_mode": get_policy_label(
+                                get_denoise_reveal_config(train_config["denoise"]).get("policy"),
+                                "greedy",
+                            ),
                         },
                     )
                 
@@ -1239,7 +1241,10 @@ def main():
                 "epoch": int(epoch),
                 "train": train_stats,
                 "test": test_stats,
-                "decode_mode": str(train_config["denoise"]["reveal_strategy"]),
+                "decode_mode": get_policy_label(
+                    get_denoise_reveal_config(train_config["denoise"]).get("policy"),
+                    "greedy",
+                ),
             },
         )
 
