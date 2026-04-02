@@ -69,7 +69,7 @@
     "train_micro_batch_size_per_gpu": 1,
     "wall_clock_breakdown": false,
     "training_parameters": {
-        "wandb_name": "cfg6-p1-l30-r32-a64-lm-t6-mlp-7.5lr-2",
+        "wandb_name": "cfg6-p1-l30-r32-a64-lm-t6-mlp-7.5lr-2-denoise-mix",
         "bs": 4,
         "num_epochs": 4,
         "num_workers": 2,
@@ -85,10 +85,10 @@
             "enabled": true,
             "weight_type": "manual",
             "manual_weights": [
-                0.2,
-                0.2,
-                0.2,
-                0.2,
+                0.5,
+                0.5,
+                0.75,
+                0.75,
                 1.0,
                 1.0
             ],
@@ -174,9 +174,29 @@
     ],
     "denoise": {
         "steps": 6,
-        "reveal_k": 1,
-        "reveal_prob": 1.0,
-        "reveal_strategy": "ar_force"
+        "reveal": {
+            "k": 2,
+            "policy": {
+                "type": "mixture",
+                "choices": {
+                    "ar_force": 0.3,
+                    "greedy": 0.7
+                }
+            }
+        },
+        "decode": {
+            "policy": {
+                "type": "mixture",
+                "choices": {
+                    "fix": 0.6,
+                    "greedy_threshold": 0.4
+                }
+            },
+            "fix_k": 2,
+            "max_k": 2,
+            "min_k": 1,
+            "confidence_threshold": 0.9
+        }
     },
     "detach_recurrence": {
         "enabled": true,

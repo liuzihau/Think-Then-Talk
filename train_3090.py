@@ -864,6 +864,8 @@ def main():
             with ctx:
                 input_embeds = F.embedding(input_ids, model.talk_embed_weight)  # initial emb (step 0)
                 for idx in range(model.length):
+                    if not loss_mask.bool().any():
+                        break
                     talk_outputs = model(
                         input_ids=None,
                         inputs_embeds=input_embeds,
