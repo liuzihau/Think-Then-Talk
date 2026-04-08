@@ -73,7 +73,7 @@
     "training_parameters": {
         "wandb_name": "cfg6-p1-l30-r32-a64-lm-t6-mlp-7.5lr-3-denoise-mix",
         "bs": 4,
-        "num_epochs": 4,
+        "num_epochs": 16,
         "num_workers": 2,
         "max_len": 4096,
         "gradient_checkpointing": true
