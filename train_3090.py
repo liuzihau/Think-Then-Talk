@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 from model.modeling_t3 import T3Model
 from train.data_process import build_dataset_rank, DataCollatorWithPadding, DataCollatorWithPaddingV2
+from train.data_process_balanced import build_4block_balanced_train_and_test_datasets
 from train.visualize import visualize_t3_batch_trace
 from utils import (
     AttrDict,
@@ -665,33 +666,57 @@ def main():
         print("[Data] build_dataset_rank has no short_target_mode; using legacy behavior.")
     if "strip_nemotron_math_prompt_prefix" in build_dataset_rank_params:
         dataset_common_kwargs["strip_nemotron_math_prompt_prefix"] = data_cfg.get("strip_nemotron_math_prompt_prefix", False)
+    if "assistant_think_drop_probs" in build_dataset_rank_params:
+        dataset_common_kwargs["assistant_think_drop_probs"] = data_cfg.get("assistant_think_drop_probs", None)
 
-    traindataset = build_dataset_rank(
-        tokenizer,
-        data_cfg["train_dataset"],
-        training_parameters["max_len"],
-        target_len=data_cfg["block_size"] * data_cfg["block_num"],
-        get_test_subset=False,
-        **dataset_common_kwargs,
-    )
-    testdataset = build_dataset_rank(
-        tokenizer,
-        data_cfg["train_dataset"],
-        training_parameters["max_len"],
-        target_len=data_cfg["block_size"] * data_cfg["block_num"],
-        get_test_subset=True,
-        **dataset_common_kwargs,
-    )
+    sampling_mode = data_cfg.get("sampling_mode", "default")
+    if sampling_mode == "balanced_4block":
+        traindataset, train_batch_sampler, testdataset, block_info = build_4block_balanced_train_and_test_datasets(
+            tokenizer,
+            data_cfg,
+            max_len=training_parameters["max_len"],
+            target_len=data_cfg["block_size"] * data_cfg["block_num"],
+            seed=SEED,
+            batch_size=training_parameters["bs"],
+        )
+        print("[Data] using balanced_4block sampling with train block sizes:", block_info)
+    else:
+        train_batch_sampler = None
+        traindataset = build_dataset_rank(
+            tokenizer,
+            data_cfg["train_dataset"],
+            training_parameters["max_len"],
+            target_len=data_cfg["block_size"] * data_cfg["block_num"],
+            get_test_subset=False,
+            **dataset_common_kwargs,
+        )
+        testdataset = build_dataset_rank(
+            tokenizer,
+            data_cfg["train_dataset"],
+            training_parameters["max_len"],
+            target_len=data_cfg["block_size"] * data_cfg["block_num"],
+            get_test_subset=True,
+            **dataset_common_kwargs,
+        )
     print(f"Train data: {len(traindataset)}, Test data: {len(testdataset)}")
 
-    train_loader = DataLoader(
-        traindataset,
-        batch_size=training_parameters["bs"],
-        num_workers=0,
-        shuffle=True,
-        pin_memory=True,
-        collate_fn=DataCollatorWithPaddingV2(block_size=train_config["data"]["block_size"], block_num=train_config["data"]["block_num"])
-    )
+    if train_batch_sampler is None:
+        train_loader = DataLoader(
+            traindataset,
+            batch_size=training_parameters["bs"],
+            num_workers=0,
+            shuffle=True,
+            pin_memory=True,
+            collate_fn=DataCollatorWithPaddingV2(block_size=train_config["data"]["block_size"], block_num=train_config["data"]["block_num"])
+        )
+    else:
+        train_loader = DataLoader(
+            traindataset,
+            batch_sampler=train_batch_sampler,
+            num_workers=0,
+            pin_memory=True,
+            collate_fn=DataCollatorWithPaddingV2(block_size=train_config["data"]["block_size"], block_num=train_config["data"]["block_num"])
+        )
     test_loader = DataLoader(
         testdataset,
         batch_size=training_parameters["bs"],

@@ -3,17 +3,50 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 from model.modeling_t3 import T3Model
-from utils import load_ckpt, denoise_k_step_soft_embed_v2, select_reveal_positions
+from utils import (
+    denoise_k_step_hard,
+    denoise_k_step_soft_embed_v2,
+    get_denoise_decode_config,
+    get_denoise_reveal_config,
+    get_policy_label,
+    load_ckpt,
+)
+
+
+def extract_code_block(text):
+    if "```python" in text:
+        return text.split("```python", 1)[1].split("```", 1)[0].strip()
+    if "```" in text:
+        return text.split("```", 1)[1].split("```", 1)[0].strip()
+    return text
+
+
+def extract_function_body(text):
+    if "def " not in text:
+        return text.strip()
+
+    body = text.split("def ", 1)[1]
+    if ":\n" in body:
+        body = body.split(":\n", 1)[1]
+    
+    if '"""\n' in body:
+        body = body.split('"""\n', 1)[-1]
+        
+    elif "'''\n" in body:
+        body = body.split("'''\n", 1)[-1]
+
+    return body
 
 parser = argparse.ArgumentParser()
-# parser.add_argument("--ckpt_path", type=str, default="stage2-b8-warmstart-arforce-8-128-1/state_3")
-parser.add_argument("--ckpt_path", type=str, default="1token-1-512-1/state_0")
-parser.add_argument("--gen_length", type=int, default=128)
-parser.add_argument("--steps", type=int, default=128)
-parser.add_argument("--block_size", type=int, default=1)
-parser.add_argument("--think_device1", type=str, default="cuda:0")
-parser.add_argument("--think_device2", type=str, default="cuda:0")
-parser.add_argument("--talk_device", type=str, default="cuda:0")
+parser.add_argument("--ckpt_path", type=str, default="cfg6-p1-l30-r32-a64-lm-t6-mlp-7.5lr-2-denoise-mix-6-90-2/state_0")
+parser.add_argument("--gen_length", type=int, default=768)
+parser.add_argument("--steps", type=int, default=768)
+parser.add_argument("--block_size", type=int, default=6)
+parser.add_argument("--think_device1", type=str, default="cuda:3")
+parser.add_argument("--think_device2", type=str, default="cuda:3")
+parser.add_argument("--talk_device", type=str, default="cuda:3")
+parser.add_argument("--prompt_mode", choices=["chat", "raw"], default="chat")
+parser.add_argument("--extract_code", action="store_true")
 args = parser.parse_args()
 
 THINK_DEVICE1 = args.think_device1
@@ -31,41 +64,41 @@ model = T3Model(model_config, think_dev1=THINK_DEVICE1, think_dev2=THINK_DEVICE2
 model.eval()
 load_ckpt(args.ckpt_path, model, None, None, map_location="cpu")
 denoise_cfg = model_config.get("denoise", {})
-reveal_mode = str(denoise_cfg.get("reveal_strategy", "ar_force"))
-reveal_k = int(denoise_cfg.get("reveal_k", 1))
+reveal_cfg = get_denoise_reveal_config(denoise_cfg)
+decode_cfg = get_denoise_decode_config(denoise_cfg, default_k=reveal_cfg["k"])
+reveal_mode = get_policy_label(reveal_cfg.get("policy"), "ar_force")
+reveal_k = int(reveal_cfg["k"])
 
-messages = [{
-    "role": "system",
-    "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."
-    }]
+# messages = [{
+#     "role": "system",
+#     "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."
+#     }]
+messages = []
 convroles = ["user", "assistant"]
 roles = {"human", "user", "gpt", "assistant"}
 
 user_input = input("Enter your question: ")
+# user_input = """from typing import List
+
+
+# def has_close_elements(numbers: List[float], threshold: float) -> bool:
+#     \"\"\" Check if in given list of numbers, are any two numbers closer to each other than
+#     given threshold.
+#     >>> has_close_elements([1.0, 2.0, 3.0], 0.5)
+#     False
+#     >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)
+#     True
+#     \"\"\""""
 messages.append({"role": "user", "content": user_input})
 
-user_input = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-# user_input = """<|startoftext|><|start_header_id|>system<|end_header_id|>
+if args.prompt_mode == "raw":
+    prompt_text = user_input
+else:
+    prompt_text = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=False
+    )
 
-# You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.
-
-# If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-# [blog]:販売するサイト
-
-# [item]:まつ毛美容液
-# [age]:30歳から35歳のシングルマザー
-# [key]:まつ毛が育毛できる・長く見せることができる
-# [number]:30
-
-# [C1]=:最終的に[item]を[blog]を作りたいと思います。[age]に向けて[item]以外で[key]アイテム・サービスのネガティブな悩みから販売につなげたいと思います。具体的な悩みを[number]考えて下さい。。
-
-# &gt; Run[C1]copy<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-# **[C1] 実行結果: 悩みを販売につなげるアイデア集**
-
-# **最終目標:** `[item]` (まつ毛美容液) を販売する `[blog]` 作り、"""
-input_ids = tokenizer(user_input, return_tensors="pt", add_special_tokens=False).input_ids[0]
+input_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False).input_ids[0]
 input_ids = input_ids.to(THINK_DEVICE1).unsqueeze(0)
 seq_len = input_ids.shape[1]
 max_len = seq_len + GEN_LEN
@@ -83,7 +116,6 @@ x[:, :seq_len] = input_ids.clone()
 past_key_values = None
 x0 = x[:, :seq_len + args.block_size]
 p0 = position_ids[:, :seq_len + args.block_size]
-# print(tokenizer.decode(x0[0].detach().view(-1).tolist()))
 attn_mask = attention_mask[:, :x0.shape[-1]]
 attn_bias = attention_bias[:x0.shape[-1], :x0.shape[-1]]
 attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)
@@ -129,6 +161,8 @@ for block_idx in range(GEN_LEN // args.block_size):
 
     talk_input_embeds = F.embedding(talk_input_ids, model.talk_embed_weight)  # initial emb (step 0)
     for idx in range(model.length):
+        if not loss_mask.bool().any():
+            break
         talk_outputs = model(
             input_ids=None,
             inputs_embeds=talk_input_embeds,
@@ -152,29 +186,23 @@ for block_idx in range(GEN_LEN // args.block_size):
                     k_reveal=reveal_k,
                     soft_topk=model_config["soft_inputs"]["top_k"],
                     soft_temp=model_config["soft_inputs"]["temperature"],
-                    mode=reveal_mode,
-                    sample_tokens=False,
+                    mode=reveal_cfg.get("policy", "ar_force"),
+                    decode_cfg=decode_cfg,
+                    # sample_tokens=True,
                     # repetition_penalty=1.4,
                     # temperature=1,
                     # top_p=0.9
                 )
         else:
             # Hard iterative reveal fallback: reveal only k positions each denoise step.
-            idx = select_reveal_positions(
+            talk_input_ids, loss_mask, _, _ = denoise_k_step_hard(
+                input_ids=talk_input_ids,
+                target=None,
                 loss_mask=loss_mask,
                 logits=logits,
-                k_reveal=reveal_k,
-                mode=reveal_mode,
+                reveal_cfg=reveal_cfg,
+                decode_cfg=decode_cfg,
             )
-            rows = torch.arange(talk_input_ids.size(0), device=TALK_DEVICE).unsqueeze(1).expand_as(idx)
-            chosen_active = loss_mask.bool().gather(1, idx)
-            rows = rows[chosen_active]
-            cols = idx[chosen_active]
-            pred = logits.argmax(dim=-1)
-            talk_input_ids = talk_input_ids.clone()
-            loss_mask = loss_mask.clone()
-            talk_input_ids[rows, cols] = pred[rows, cols]
-            loss_mask[rows, cols] = 0
             talk_input_embeds = F.embedding(talk_input_ids, model.talk_embed_weight)
         
     if TALK_DEVICE != THINK_DEVICE1:
@@ -188,4 +216,12 @@ for block_idx in range(GEN_LEN // args.block_size):
     attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)
 print(f"Decode time: {time.time()-start_time:.3f}")
 print("AI Reply:")
-print(tokenizer.decode(x[:, seq_len:].detach().view(-1).tolist()))
+decoded = tokenizer.decode(x[:, seq_len:seq_len + GEN_LEN].detach().view(-1).tolist(), skip_special_tokens=True)
+print(decoded)
+# print("-"*80)
+# if args.extract_code:
+#     decoded = extract_code_block(decoded)
+
+# # Test-only postprocess: strip the function signature and leading docstring if present.
+# body = extract_function_body(decoded)
+# print(body)

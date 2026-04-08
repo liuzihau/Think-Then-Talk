@@ -180,6 +180,38 @@ def get_policy_label(policy: Any, default_mode: str) -> str:
     return default_mode
 
 
+def _normalize_decode_mode_name(mode: Any) -> Any:
+    if not isinstance(mode, str):
+        return mode
+    if mode in {"greedy_threshold", "confidence_threshold"}:
+        return "greedy"
+    return mode
+
+
+def _normalize_decode_policy(policy: Any) -> Any:
+    if isinstance(policy, str):
+        return _normalize_decode_mode_name(policy)
+    if not isinstance(policy, dict):
+        return policy
+
+    policy = dict(policy)
+    policy_type = str(policy.get("type", "fixed"))
+    if policy_type == "mixture":
+        raw_choices = policy.get("choices", {})
+        if isinstance(raw_choices, dict):
+            merged_choices = {}
+            for name, weight in raw_choices.items():
+                norm_name = _normalize_decode_mode_name(name)
+                merged_choices[norm_name] = merged_choices.get(norm_name, 0.0) + float(weight)
+            policy["choices"] = merged_choices
+        return policy
+
+    for key in ("value", "mode", "name"):
+        if key in policy:
+            policy[key] = _normalize_decode_mode_name(policy[key])
+    return policy
+
+
 def get_denoise_reveal_config(denoise_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     denoise_cfg = denoise_cfg or {}
     reveal = denoise_cfg.get("reveal", {})
@@ -199,7 +231,7 @@ def get_denoise_decode_config(
     decode = denoise_cfg.get("decode", {})
     decode = dict(decode) if isinstance(decode, dict) else {}
 
-    decode["policy"] = decode.get("policy", "fix")
+    decode["policy"] = _normalize_decode_policy(decode.get("policy", "fix"))
     decode["fix_k"] = int(decode.get("fix_k", default_k))
     decode["max_k"] = int(decode.get("max_k", decode["fix_k"]))
     decode["min_k"] = int(decode.get("min_k", 1))
@@ -284,7 +316,7 @@ def resolve_denoise_positions(
 
     if decode_mode == "fix":
         reveal_counts = torch.full((BG,), decode_fix_k, dtype=torch.long, device=device)
-    elif decode_mode in {"greedy", "greedy_threshold", "confidence_threshold"}:
+    elif decode_mode == "greedy":
         if logits is None:
             raise ValueError(f"decode mode '{decode_mode}' requires logits.")
         conf = F.softmax(logits, dim=-1).amax(dim=-1)

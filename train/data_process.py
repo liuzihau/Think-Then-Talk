@@ -1,3 +1,4 @@
+import hashlib
 import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -5,6 +6,16 @@ import torch
 from datasets import Dataset, Features, Sequence, Value, load_dataset, load_from_disk, concatenate_datasets
 import numpy as np
 import matplotlib.pyplot as plt
+
+HENDRYCKS_MATH_CONFIGS = [
+    "algebra",
+    "counting_and_probability",
+    "geometry",
+    "intermediate_algebra",
+    "number_theory",
+    "prealgebra",
+    "precalculus",
+]
 
 
 def build_dataset_rank(
@@ -21,6 +32,7 @@ def build_dataset_rank(
     seed: int = 42,
     short_target_mode: str = "skip",  # "pad_eos", "skip", or "keep"
     strip_nemotron_math_prompt_prefix: bool = False,
+    assistant_think_drop_probs: Optional[str] = None,
     train_subset_percents: Optional[str] = None,
     test_subset_percents: Optional[str] = None,
     train_subset_offsets: Optional[str] = None,
@@ -76,6 +88,8 @@ def build_dataset_rank(
             return config
         if repo_id == "gsm8k":
             return "main"
+        if repo_id in {"google-research-datasets/mbpp", "mbpp"}:
+            return "full"
         if repo_id in {"cais/mmlu", "hendrycks_test"}:
             return "all"
         return None
@@ -83,6 +97,24 @@ def build_dataset_rank(
     def _safe_dirname(s: str) -> str:
         s = s.strip()
         return re.sub(r"[^\w\-.]+", "_", s)
+
+    def _expand_special_datapaths(
+        paths_in: List[str],
+        splits_in: List[str],
+    ) -> Tuple[List[str], List[str]]:
+        out_paths: List[str] = []
+        out_splits: List[str] = []
+
+        for datapath, requested_split in zip(paths_in, splits_in):
+            repo_id, config = _parse_hf_id(datapath)
+            if repo_id == "EleutherAI/hendrycks_math" and config is None:
+                out_paths.extend([f"{repo_id}:{cfg}" for cfg in HENDRYCKS_MATH_CONFIGS])
+                out_splits.extend([requested_split] * len(HENDRYCKS_MATH_CONFIGS))
+            else:
+                out_paths.append(datapath)
+                out_splits.append(requested_split)
+
+        return out_paths, out_splits
 
     def _parse_percent_list(v: Optional[str], n: int, name: str) -> Optional[List[float]]:
         if v is None:
@@ -105,16 +137,32 @@ def build_dataset_rank(
             out.append(fp)
         return out
 
+    def _deterministic_unit_float(*parts: Any) -> float:
+        payload = "||".join(str(p) for p in parts).encode("utf-8")
+        digest = hashlib.sha256(payload).digest()
+        return int.from_bytes(digest[:8], "big") / float(1 << 64)
+
+    def _strip_assistant_think_blocks(text: str) -> str:
+        if not isinstance(text, str):
+            return text
+        stripped = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+        return stripped.strip()
+
     def _resolve_split(datapath: str, requested_split: str, use_test_split: bool) -> str:
         if requested_split != "auto":
             return requested_split
         repo_id, _ = _parse_hf_id(datapath)
         if repo_id == "gsm8k":
             return "test" if use_test_split else "train"
+        if repo_id == "EleutherAI/hendrycks_math":
+            return "test" if use_test_split else "train"
         if repo_id in {"cais/mmlu", "hendrycks_test"}:
             return "test" if use_test_split else "auxiliary_train"
         if repo_id in {"openai/openai_humaneval", "openai_humaneval"}:
             return "test"
+        if repo_id in {"google-research-datasets/mbpp", "mbpp"}:
+            return "test" if use_test_split else "train"
         if repo_id == "nvidia/Llama-Nemotron-Post-Training-Dataset":
             return "chat"
         if repo_id == "allenai/tulu-3-sft-mixture":
@@ -127,10 +175,13 @@ def build_dataset_rank(
         repo_id, _ = _parse_hf_id(datapath)
         return repo_id in {
             "gsm8k",
+            "EleutherAI/hendrycks_math",
             "cais/mmlu",
             "hendrycks_test",
             "openai/openai_humaneval",
             "openai_humaneval",
+            "google-research-datasets/mbpp",
+            "mbpp",
         }
 
     def _ensure_pad_token():
@@ -226,6 +277,24 @@ def build_dataset_rank(
                 return idx if 0 <= idx < num_choices else None
         return None
 
+    def _normalize_mbpp_tests(tests: Any) -> List[str]:
+        if tests is None:
+            return []
+        if isinstance(tests, str):
+            s = tests.strip()
+            return [s] if s else []
+        if isinstance(tests, (list, tuple)):
+            out = []
+            for item in tests:
+                if item is None:
+                    continue
+                s = str(item).strip()
+                if s:
+                    out.append(s)
+            return out
+        s = str(tests).strip()
+        return [s] if s else []
+
     def _empty_processed_dataset():
         empty_features = Features({
             "input_ids": Sequence(Value("int64")),
@@ -242,7 +311,12 @@ def build_dataset_rank(
     # -----------------------------
     # Dataset-specific adapters
     # -----------------------------
-    def _iter_conversations_from_batch(datapath: str, examples: Dict) -> List[str]:
+    def _iter_conversations_from_batch(
+        datapath: str,
+        requested_split: str,
+        examples: Dict,
+        think_drop_prob: float,
+    ) -> List[str]:
         conversations: List[str] = []
 
         repo_id, _ = _parse_hf_id(datapath)
@@ -270,6 +344,16 @@ def build_dataset_rank(
                     ):
                         content = content.removeprefix(NEMOTRON_MATH_PROMPT_PREFIX)
                     messages.append({"role": msg["role"], "content": content})
+                if think_drop_prob > 0.0 and _deterministic_unit_float(
+                    datapath,
+                    requested_split,
+                    seed,
+                    i,
+                    response,
+                ) < think_drop_prob:
+                    response = _strip_assistant_think_blocks(response)
+                if not response:
+                    continue
                 messages.append({"role": "assistant", "content": response})
 
                 conversations.append(_apply_chat_template(messages))
@@ -310,6 +394,29 @@ def build_dataset_rank(
 
             return conversations
 
+        if repo_id == "EleutherAI/hendrycks_math":
+            problems = examples.get("problem", [])
+            solutions = examples.get("solution", [])
+            data_pts = min(len(problems), len(solutions))
+            for i in range(data_pts):
+                problem = problems[i]
+                solution = solutions[i]
+                if not problem or not solution:
+                    continue
+
+                user_prompt = (
+                    "Solve the following math problem. Make sure to put the answer "
+                    "(and only answer) inside \\boxed{}.\n\n"
+                    f"{str(problem).strip()}"
+                )
+
+                messages = []
+                messages.append({"role": "user", "content": user_prompt})
+                messages.append({"role": "assistant", "content": str(solution).strip()})
+                conversations.append(_apply_chat_template(messages))
+
+            return conversations
+
         if repo_id in {"openai/openai_humaneval", "openai_humaneval"}:
             prompts = examples.get("prompt", [])
             solutions = examples.get("canonical_solution", [])
@@ -326,6 +433,41 @@ def build_dataset_rank(
                 messages = []
                 messages.append({"role": "user", "content": user_prompt})
                 messages.append({"role": "assistant", "content": solution})
+                conversations.append(_apply_chat_template(messages))
+
+            return conversations
+
+        if repo_id in {"google-research-datasets/mbpp", "mbpp"}:
+            prompts = examples.get("text", [])
+            solutions = examples.get("code", [])
+            test_lists = examples.get("test_list", [])
+            test_setup_codes = examples.get("test_setup_code", [])
+            data_pts = min(len(prompts), len(solutions))
+            for i in range(data_pts):
+                prompt = prompts[i]
+                solution = solutions[i]
+                if not prompt or not solution:
+                    continue
+
+                tests = _normalize_mbpp_tests(test_lists[i] if i < len(test_lists) else None)
+                test_setup_code = ""
+                if i < len(test_setup_codes) and test_setup_codes[i] is not None:
+                    test_setup_code = str(test_setup_codes[i]).strip()
+
+                user_prompt = (
+                    "Write a Python function or program that satisfies the following specification.\n\n"
+                    f"{str(prompt).strip()}"
+                )
+                if tests:
+                    user_prompt += "\n\nYour solution should pass these example tests:\n"
+                    user_prompt += "\n".join(tests)
+                if test_setup_code:
+                    user_prompt += "\n\nUse this setup code if needed:\n"
+                    user_prompt += test_setup_code
+
+                messages = []
+                messages.append({"role": "user", "content": user_prompt})
+                messages.append({"role": "assistant", "content": str(solution).strip()})
                 conversations.append(_apply_chat_template(messages))
 
             return conversations
@@ -368,11 +510,20 @@ def build_dataset_rank(
 
         raise ValueError(f"Unsupported datapath for preprocessing: {datapath}")
 
-    def _make_preprocess_fn(datapath: str) -> Callable[[Dict], Dict]:
+    def _make_preprocess_fn(
+        datapath: str,
+        requested_split: str,
+        think_drop_prob: float,
+    ) -> Callable[[Dict], Dict]:
         def _fn(examples: Dict) -> Dict:
             new_examples = {"attention_mask": [], "target": [], "input_ids": []}
 
-            conversations = _iter_conversations_from_batch(datapath, examples)
+            conversations = _iter_conversations_from_batch(
+                datapath,
+                requested_split,
+                examples,
+                think_drop_prob,
+            )
             for conv in conversations:
                 out = _build_prompt_and_target(conv)
                 if out is None:
@@ -394,10 +545,25 @@ def build_dataset_rank(
 
     paths = [p.strip() for p in datapaths.split(",") if p.strip()]
     all_splits = [p.strip() for p in splits.split(",") if p.strip()]
+
+    if not paths:
+        raise ValueError("datapaths is empty. Provide at least one dataset path or HF dataset id.")
+
+    if len(all_splits) == 1 and len(paths) > 1:
+        all_splits = all_splits * len(paths)
+    if len(paths) != len(all_splits):
+        raise ValueError(
+            f"paths ({len(paths)}) and splits ({len(all_splits)}) must have same length "
+            "or splits must provide exactly one value."
+        )
+
+    paths, all_splits = _expand_special_datapaths(paths, all_splits)
+
     train_pcts = _parse_percent_list(train_subset_percents, len(paths), "train_subset_percents")
     test_pcts = _parse_percent_list(test_subset_percents, len(paths), "test_subset_percents")
     train_offsets = _parse_percent_list(train_subset_offsets, len(paths), "train_subset_offsets")
     test_offsets = _parse_percent_list(test_subset_offsets, len(paths), "test_subset_offsets")
+    think_drop_pcts = _parse_percent_list(assistant_think_drop_probs, len(paths), "assistant_think_drop_probs")
     use_explicit_subset_percents = (
         (train_pcts is not None)
         or (test_pcts is not None)
@@ -414,18 +580,7 @@ def build_dataset_rank(
         if test_offsets is None:
             test_offsets = [0.0] * len(paths)
 
-    if not paths:
-        raise ValueError("datapaths is empty. Provide at least one dataset path or HF dataset id.")
-
     final_ds = None
-
-    if len(all_splits) == 1 and len(paths) > 1:
-        all_splits = all_splits * len(paths)
-    if len(paths) != len(all_splits):
-        raise ValueError(
-            f"paths ({len(paths)}) and splits ({len(all_splits)}) must have same length "
-            "or splits must provide exactly one value."
-        )
 
     for i_path, (datapath, requested_split) in enumerate(zip(paths, all_splits)):
         split = _resolve_split(datapath, requested_split, get_test_subset)
@@ -459,6 +614,7 @@ def build_dataset_rank(
         test_pct_i = test_pcts[i_path] if use_explicit_subset_percents else None
         train_offset_i = train_offsets[i_path] if use_explicit_subset_percents else None
         test_offset_i = test_offsets[i_path] if use_explicit_subset_percents else None
+        think_drop_prob_i = 0.0 if think_drop_pcts is None else (float(think_drop_pcts[i_path]) / 100.0)
 
         if use_explicit_subset_percents:
             n_total = len(ds)
@@ -556,6 +712,7 @@ def build_dataset_rank(
         proc_key = _safe_dirname(
             f"{datapath}:{split}:req{requested_split}:{tok_id}:max{max_len}:tgt{target_len}:"
             f"seed{seed}:short{short_target_mode}:stripnemo{int(strip_nemotron_math_prompt_prefix)}:tsr{test_split_ratio}:"
+            f"thinkdrop{think_drop_prob_i}:"
             f"trpct{train_pct_i if train_pct_i is not None else 'na'}:"
             f"tepct{test_pct_i if test_pct_i is not None else 'na'}:"
             f"troff{train_offset_i if train_offset_i is not None else 'na'}:"
@@ -575,7 +732,7 @@ def build_dataset_rank(
                 ds1_proc = None
 
         if ds1_proc is None:
-            preprocess_fn = _make_preprocess_fn(datapath)
+            preprocess_fn = _make_preprocess_fn(datapath, requested_split, think_drop_prob_i)
             ds1_proc = ds1.map(
                 preprocess_fn,
                 batched=True,

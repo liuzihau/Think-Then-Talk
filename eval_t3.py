@@ -7,6 +7,7 @@ import json
 import time
 import random
 import re
+from typing import Any, Dict, Optional
 import torch
 
 import numpy as np
@@ -22,9 +23,15 @@ from lm_eval.api.registry import register_model
 from transformers import AutoTokenizer
 
 from model.modeling_t3 import T3Model
-from utils import load_ckpt, denoise_k_step_soft_embed_v2, select_reveal_positions
-
-
+from model.modeling_t3_infer import T3InferenceModel
+from utils import (
+    denoise_k_step_hard,
+    denoise_k_step_soft_embed_v2,
+    get_denoise_decode_config,
+    get_denoise_reveal_config,
+    get_policy_label,
+    load_ckpt,
+)
 def set_seed(seed):
     torch.manual_seed(seed)
     random.seed(seed)
@@ -33,8 +40,192 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-@register_model("t3_model")
-class T3EvalHarness(LM):
+def _is_missing_override(value: Any) -> bool:
+    return value is None or value == ""
+
+
+def _as_optional_int(value: Any) -> Optional[int]:
+    if _is_missing_override(value):
+        return None
+    return int(value)
+
+
+def _as_optional_float(value: Any) -> Optional[float]:
+    if _is_missing_override(value):
+        return None
+    return float(value)
+
+
+def _as_optional_str(value: Any) -> Optional[str]:
+    if _is_missing_override(value):
+        return None
+    return str(value)
+
+
+def _as_optional_bool(value: Any) -> Optional[bool]:
+    if _is_missing_override(value):
+        return None
+    if isinstance(value, bool):
+        return value
+    value_str = str(value).strip().lower()
+    if value_str in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value_str in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Cannot parse boolean override from value: {value!r}")
+
+
+def _require_explicit_overrides(use_sh_denoise_policy: bool, raw_overrides: Dict[str, Any]) -> None:
+    if not use_sh_denoise_policy:
+        return
+
+    missing = [name for name, value in raw_overrides.items() if _is_missing_override(value)]
+    if missing:
+        raise ValueError(
+            "USE_SH_DENOISE_POLICY=1 requires every reveal/decode override to be set explicitly. "
+            "Missing: " + ", ".join(sorted(missing))
+        )
+
+
+def _extract_policy_choices(policy: Any, valid_modes) -> Dict[str, float]:
+    choices = {mode: 0.0 for mode in valid_modes}
+    if isinstance(policy, str) and policy in choices:
+        choices[policy] = 1.0
+        return choices
+    if isinstance(policy, dict):
+        raw_choices = policy.get("choices", {})
+        if isinstance(raw_choices, dict):
+            for mode in valid_modes:
+                if mode in raw_choices:
+                    choices[mode] = float(raw_choices[mode])
+    return choices
+
+
+def _build_policy_override(
+    current_policy: Any,
+    *,
+    fixed_mode: Optional[str],
+    weight_overrides: Dict[str, Optional[float]],
+) -> Any:
+    if fixed_mode is not None:
+        return fixed_mode
+
+    provided_weights = {
+        mode: weight
+        for mode, weight in weight_overrides.items()
+        if weight is not None
+    }
+    if not provided_weights:
+        return current_policy
+
+    merged_choices = _extract_policy_choices(current_policy, weight_overrides.keys())
+    for mode, weight in provided_weights.items():
+        merged_choices[mode] = float(weight)
+
+    return {
+        "type": "mixture",
+        "choices": merged_choices,
+    }
+
+
+def _apply_denoise_overrides(
+    model_config: Dict[str, Any],
+    *,
+    use_sh_denoise_policy=None,
+    reveal_k=None,
+    reveal_policy_mode=None,
+    reveal_random_weight=None,
+    reveal_greedy_weight=None,
+    reveal_ar_force_weight=None,
+    decode_policy_mode=None,
+    decode_fix_k=None,
+    decode_max_k=None,
+    decode_min_k=None,
+    decode_confidence_threshold=None,
+    decode_fix_weight=None,
+    decode_greedy_weight=None,
+) -> Dict[str, Any]:
+    use_sh_denoise_policy = _as_optional_bool(use_sh_denoise_policy)
+    use_sh_denoise_policy = bool(use_sh_denoise_policy) if use_sh_denoise_policy is not None else False
+
+    raw_overrides = {
+        "reveal_k": reveal_k,
+        "reveal_policy_mode": reveal_policy_mode,
+        "reveal_random_weight": reveal_random_weight,
+        "reveal_greedy_weight": reveal_greedy_weight,
+        "reveal_ar_force_weight": reveal_ar_force_weight,
+        "decode_policy_mode": decode_policy_mode,
+        "decode_fix_k": decode_fix_k,
+        "decode_max_k": decode_max_k,
+        "decode_min_k": decode_min_k,
+        "decode_confidence_threshold": decode_confidence_threshold,
+        "decode_fix_weight": decode_fix_weight,
+        "decode_greedy_weight": decode_greedy_weight,
+    }
+    _require_explicit_overrides(use_sh_denoise_policy, raw_overrides)
+
+    if not use_sh_denoise_policy:
+        return model_config
+
+    denoise_cfg = dict(model_config.get("denoise", {}) or {})
+    reveal_cfg = get_denoise_reveal_config(denoise_cfg)
+    decode_cfg = get_denoise_decode_config(denoise_cfg, default_k=reveal_cfg["k"])
+
+    reveal_k = _as_optional_int(reveal_k)
+    decode_fix_k = _as_optional_int(decode_fix_k)
+    decode_max_k = _as_optional_int(decode_max_k)
+    decode_min_k = _as_optional_int(decode_min_k)
+    decode_confidence_threshold = _as_optional_float(decode_confidence_threshold)
+
+    reveal_policy_mode = _as_optional_str(reveal_policy_mode)
+    decode_policy_mode = _as_optional_str(decode_policy_mode)
+
+    reveal_random_weight = _as_optional_float(reveal_random_weight)
+    reveal_greedy_weight = _as_optional_float(reveal_greedy_weight)
+    reveal_ar_force_weight = _as_optional_float(reveal_ar_force_weight)
+
+    decode_fix_weight = _as_optional_float(decode_fix_weight)
+    decode_greedy_weight = _as_optional_float(decode_greedy_weight)
+    if reveal_k is not None:
+        reveal_cfg["k"] = reveal_k
+
+    reveal_cfg["policy"] = _build_policy_override(
+        reveal_cfg.get("policy"),
+        fixed_mode=reveal_policy_mode,
+        weight_overrides={
+            "random": reveal_random_weight,
+            "greedy": reveal_greedy_weight,
+            "ar_force": reveal_ar_force_weight,
+        },
+    )
+
+    if decode_fix_k is not None:
+        decode_cfg["fix_k"] = decode_fix_k
+    if decode_max_k is not None:
+        decode_cfg["max_k"] = decode_max_k
+    if decode_min_k is not None:
+        decode_cfg["min_k"] = decode_min_k
+    if decode_confidence_threshold is not None:
+        decode_cfg["confidence_threshold"] = decode_confidence_threshold
+
+    decode_cfg["policy"] = _build_policy_override(
+        decode_cfg.get("policy"),
+        fixed_mode=decode_policy_mode,
+        weight_overrides={
+            "fix": decode_fix_weight,
+            "greedy": decode_greedy_weight,
+        },
+    )
+
+    denoise_cfg["reveal"] = reveal_cfg
+    denoise_cfg["decode"] = decode_cfg
+    model_config["denoise"] = denoise_cfg
+    return model_config
+
+
+class _BaseT3EvalHarness(LM):
+    MODEL_CLS = T3Model
+
     def __init__(
         self,
         ckpt_path='',
@@ -54,6 +245,19 @@ class T3EvalHarness(LM):
         show_speed=False,
         prompt_prefix="",
         prompt_suffix="",
+        reveal_k=None,
+        reveal_policy_mode=None,
+        reveal_random_weight=None,
+        reveal_greedy_weight=None,
+        reveal_ar_force_weight=None,
+        use_sh_denoise_policy=None,
+        decode_policy_mode=None,
+        decode_fix_k=None,
+        decode_max_k=None,
+        decode_min_k=None,
+        decode_confidence_threshold=None,
+        decode_fix_weight=None,
+        decode_greedy_weight=None,
         **kwargs,
     ):
         super().__init__()
@@ -78,6 +282,22 @@ class T3EvalHarness(LM):
         config_path = os.path.join(ckpt_path, "config.json")
         with open(config_path) as f:
             self.model_config = json.load(f)
+        self.model_config = _apply_denoise_overrides(
+            self.model_config,
+            use_sh_denoise_policy=use_sh_denoise_policy,
+            reveal_k=reveal_k,
+            reveal_policy_mode=reveal_policy_mode,
+            reveal_random_weight=reveal_random_weight,
+            reveal_greedy_weight=reveal_greedy_weight,
+            reveal_ar_force_weight=reveal_ar_force_weight,
+            decode_policy_mode=decode_policy_mode,
+            decode_fix_k=decode_fix_k,
+            decode_max_k=decode_max_k,
+            decode_min_k=decode_min_k,
+            decode_confidence_threshold=decode_confidence_threshold,
+            decode_fix_weight=decode_fix_weight,
+            decode_greedy_weight=decode_greedy_weight,
+        )
 
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -86,26 +306,38 @@ class T3EvalHarness(LM):
         )
 
         # Load T3 model
-        self.model = T3Model(
+        self.model = self.MODEL_CLS(
             self.model_config,
+            train=False,
             think_dev1=think_device1,
             think_dev2=think_device2,
             talk_dev=talk_device,
         )
         self.model.eval()
         load_ckpt(ckpt_path, self.model, None, None, map_location="cpu")
+        self.think_device1 = self.model.think_dev1
+        self.think_device2 = self.model.think_dev2
+        self.talk_device = self.model.talk_dev
 
-        # steps = number of denoise iterations per block
-        # In T3, each block gets model.length denoise steps
-        self.steps_per_block = self.model.length
+        # Use the training-time denoise schedule when available.
+        # model.length is the block size copied from training config.
         self.num_blocks = self.gen_length // self.block_size
         denoise_cfg = self.model_config.get("denoise", {})
-        self.reveal_mode = str(denoise_cfg.get("reveal_strategy", "ar_force"))
-        self.reveal_k = int(denoise_cfg.get("reveal_k", 1))
+        self.steps_per_block = int(denoise_cfg.get("steps", self.model.length))
+        self.reveal_cfg = get_denoise_reveal_config(denoise_cfg)
+        self.decode_cfg = get_denoise_decode_config(denoise_cfg, default_k=self.reveal_cfg["k"])
+        self.reveal_mode = get_policy_label(self.reveal_cfg.get("policy"), "ar_force")
+        self.reveal_k = int(self.reveal_cfg["k"])
 
         print(
             f"[T3Eval] steps_per_block={self.steps_per_block}, num_blocks={self.num_blocks}, "
             f"reveal_mode={self.reveal_mode}, reveal_k={self.reveal_k}"
+        )
+        print(
+            "[T3Eval] denoise_reveal_cfg="
+            + json.dumps(self.reveal_cfg, ensure_ascii=False)
+            + " denoise_decode_cfg="
+            + json.dumps(self.decode_cfg, ensure_ascii=False)
         )
 
         self._rank = 0
@@ -114,52 +346,7 @@ class T3EvalHarness(LM):
     def _build_question(self, question):
         return f"{self.prompt_prefix}{question}{self.prompt_suffix}"
 
-    def _is_humaneval_request(self, req):
-        task_id = None
-        if hasattr(req, "doc") and isinstance(req.doc, dict):
-            task_id = req.doc.get("task_id")
-        return isinstance(task_id, str) and task_id.lower().startswith("humaneval")
-
-    def _is_math_request(self, req):
-        task_name = getattr(req, "task_name", None)
-        if isinstance(task_name, str) and any(
-            token in task_name.lower() for token in ("hendrycks_math", "minerva_math")
-        ):
-            return True
-        if hasattr(req, "doc") and isinstance(req.doc, dict):
-            if {"problem", "solution", "answer"}.intersection(req.doc.keys()):
-                return True
-        return False
-
-    def _extract_last_boxed_answer(self, text):
-        boxed_matches = list(re.finditer(r"\\boxed\s*(\{)?", text))
-        if not boxed_matches:
-            return text
-
-        match = boxed_matches[-1]
-        start = match.end()
-        if match.group(1) == "{":
-            depth = 1
-            idx = start
-            while idx < len(text):
-                char = text[idx]
-                if char == "{":
-                    depth += 1
-                elif char == "}":
-                    depth -= 1
-                    if depth == 0:
-                        return text[start:idx].strip()
-                idx += 1
-            return text[match.start():].strip()
-
-        line = text[start:].lstrip()
-        if not line:
-            return text
-        return line.splitlines()[0].strip()
-
     def _prepare_generation_for_eval(self, req, gen_text):
-        if self._is_math_request(req):
-            return self._extract_last_boxed_answer(gen_text)
         return gen_text
 
     @property
@@ -274,6 +461,8 @@ class T3EvalHarness(LM):
 
             # Denoise loop
             for idx in range(self.steps_per_block):
+                if not loss_mask.bool().any():
+                    break
                 talk_outputs = self.model(
                     input_ids=None,
                     inputs_embeds=talk_input_embeds,
@@ -297,28 +486,20 @@ class T3EvalHarness(LM):
                         k_reveal=self.reveal_k,
                         soft_topk=self.model_config["soft_inputs"]["top_k"],
                         soft_temp=self.model_config["soft_inputs"]["temperature"],
-                        mode=self.reveal_mode,
+                        mode=self.reveal_cfg.get("policy", "ar_force"),
+                        decode_cfg=self.decode_cfg,
                         sample_tokens=False,
                     )
                 else:
                     # Hard iterative reveal fallback (same as inference.py)
-                    idx = select_reveal_positions(
+                    talk_input_ids, loss_mask, _, _ = denoise_k_step_hard(
+                        input_ids=talk_input_ids,
+                        target=None,
                         loss_mask=loss_mask,
                         logits=logits,
-                        k_reveal=self.reveal_k,
-                        mode=self.reveal_mode,
+                        reveal_cfg=self.reveal_cfg,
+                        decode_cfg=self.decode_cfg,
                     )
-                    rows = torch.arange(
-                        talk_input_ids.size(0), device=self.talk_device
-                    ).unsqueeze(1).expand_as(idx)
-                    chosen_active = loss_mask.bool().gather(1, idx)
-                    rows = rows[chosen_active]
-                    cols = idx[chosen_active]
-                    pred = logits.argmax(dim=-1)
-                    talk_input_ids = talk_input_ids.clone()
-                    loss_mask = loss_mask.clone()
-                    talk_input_ids[rows, cols] = pred[rows, cols]
-                    loss_mask[rows, cols] = 0
                     talk_input_embeds = F.embedding(talk_input_ids, self.model.talk_embed_weight)
 
             # After denoise loop: update x and prepare next block
@@ -489,24 +670,16 @@ class T3EvalHarness(LM):
             processed_count += 1
 
             gen_ids = generated[0, prompt_len:]
-            gen_text = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
-
-            for stop_seq in stop_tokens:
-                if stop_seq in gen_text:
-                    gen_text = gen_text.split(stop_seq)[0]
-
-            gen_ids_clean = self.tokenizer(gen_text)["input_ids"]
-            gen_text_clean = self.tokenizer.decode(
-                gen_ids_clean, skip_special_tokens=True
-            )
+            gen_text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
 
             if self.show_speed:
+                gen_ids_clean = self.tokenizer(gen_text)["input_ids"]
                 num_tokens += sum(1 for t in gen_ids_clean if t != 126081)
 
-            output[req_idx] = self._prepare_generation_for_eval(req, gen_text_clean)
+            output[req_idx] = self._prepare_generation_for_eval(req, gen_text)
 
             print("=" * 20)
-            print("answer: ", gen_text_clean)
+            print("answer: ", gen_text)
             print("nfe: ", nfe)
             print("avg nfe: ", total_nfe / processed_count)
             print("=" * 20, end="\n\n")
@@ -524,6 +697,16 @@ class T3EvalHarness(LM):
             print(f"Total NFE: {total_nfe}")
 
         return output
+
+
+@register_model("t3_model")
+class T3EvalHarness(_BaseT3EvalHarness):
+    MODEL_CLS = T3Model
+
+
+@register_model("t3_model_infer")
+class T3InferenceEvalHarness(_BaseT3EvalHarness):
+    MODEL_CLS = T3InferenceModel
 
 
 if __name__ == "__main__":
