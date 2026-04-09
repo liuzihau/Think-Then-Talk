@@ -1,0 +1,239 @@
+{
+    "data": {
+        "train_dataset": "nvidia/Llama-Nemotron-Post-Training-Dataset,nvidia/Llama-Nemotron-Post-Training-Dataset,nvidia/Llama-Nemotron-Post-Training-Dataset,gsm8k:main,EleutherAI/hendrycks_math,google-research-datasets/mbpp",
+        "splits": "chat,math,code,auto,auto,auto",
+        "test_split_ratio": 0.05,
+        "train_subset_percents": "95,0.9,1.2,100,100,100",
+        "test_subset_percents": "5,0,0,0,0,0",
+        "train_subset_offsets": "0,0.7,0.7,0,0,0",
+        "test_subset_offsets": "0,0,0,0,0,0",
+        "assistant_think_drop_probs": "0,0,0,0,0,0",
+        "sampling_mode": "balanced_4block",
+        "short_target_mode": "keep",
+        "block_size": 6,
+        "block_num": 90
+    },
+    "init_from_state_dir": "cfg6-p1-l30-r32-a64-lm-t6-mlp-7.5lr-2-denoise-mix-6-90-2/state_3",
+    "bf16": {
+        "enabled": true
+    },
+    "fp16": {
+        "enabled": false,
+        "auto_cast": "true",
+        "loss_scale": 0,
+        "loss_scale_window": 1000,
+        "initial_scale_power": 14,
+        "hysteresis": 2,
+        "min_loss_scale": 1
+    },
+    "optimizer": {
+        "type": "AdamW",
+        "params": {
+            "lr": {
+                "lora": 2e-05,
+                "talk": 3e-05,
+                "lm_head": 1e-06
+            },
+            "weight_decay": {
+                "lora": 0.0,
+                "talk": 0.0,
+                "lm_head": 0.0
+            },
+            "adam_w_mode": true,
+            "betas": [
+                0.9,
+                0.95
+            ]
+        }
+    },
+    "scheduler": {
+        "type": "WarmupDecayLR",
+        "params": {
+            "warmup_min_lr": 0,
+            "warmup_max_lr": 2e-05,
+            "warmup_num_steps": 300,
+            "total_num_steps": 90000
+        }
+    },
+    "zero_optimization": {
+        "stage": 2,
+        "stage3_gather_16bit_weights_on_model_save": true,
+        "allgather_partitions": true,
+        "allgather_bucket_size": 200000000.0,
+        "overlap_comm": true,
+        "reduce_scatter": true,
+        "reduce_bucket_size": 200000000.0,
+        "contiguous_gradients": true
+    },
+    "gradient_accumulation_steps": 8,
+    "gradient_clipping": 0.8,
+    "steps_per_print": 2000,
+    "train_micro_batch_size_per_gpu": 1,
+    "wall_clock_breakdown": false,
+    "training_parameters": {
+        "wandb_name": "cfg6-p1-l30-r32-a64-lm-t6-mlp-7.5lr-4-denoise-mix",
+        "bs": 4,
+        "num_epochs": 16,
+        "num_workers": 2,
+        "max_len": 4096,
+        "gradient_checkpointing": true
+    },
+    "loss": {
+        "type": "token_nll",
+        "reduction": "sum_count",
+        "mask_init": "all_ones",
+        "mask_dtype": "float32",
+        "step_agg": {
+            "enabled": true,
+            "weight_type": "manual",
+            "manual_weights": [
+                0.5,
+                0.5,
+                0.75,
+                0.75,
+                1.0,
+                1.0
+            ],
+            "base": 0.9,
+            "cap_step": 6,
+            "min_weight": 0.0,
+            "max_weight": 1000000000.0
+        },
+        "step0_boost": {
+            "enabled": false,
+            "mode": "linear_smooth",
+            "start_multiplier": 0.1,
+            "end_multiplier": 0.25,
+            "over_epochs": 3
+        },
+        "normalize": {
+            "by_weighted_count": true,
+            "count_clamp_min": 1e-06
+        },
+        "extra": {
+            "label_smoothing": 0.0,
+            "ignore_index": -100
+        }
+    },
+    "lora": {
+        "enabled": true,
+        "start_layer": 0,
+        "r": 32,
+        "alpha": 64,
+        "dropout": 0.05,
+        "use_dora": true,
+        "target_modules": {
+            "LLaDA": [
+                "q_proj",
+                "k_proj",
+                "v_proj"
+            ],
+            "Qwen3": [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj"
+            ]
+        }
+    },
+    "think_split": {
+        "enabled": true,
+        "manual_assign": true,
+        "split_points": [
+            16
+        ],
+        "devices": [
+            "think_device1",
+            "think_device2"
+        ]
+    },
+    "train_lm_head": {
+        "enabled": true
+    },
+    "rps_residual": {
+        "enabled": true,
+        "type": "gated",
+        "eta": 0.2,
+        "norm": "rmsnorm",
+        "source_layer": -1,
+        "use_mlp": true
+    },
+    "soft_inputs": {
+        "enabled": false,
+        "top_k": 64,
+        "temperature": 1.2
+    },
+    "talk_model": {
+        "prune_last_n_layer": 2,
+        "n_layers": 2
+    },
+    "mix_indexes": [
+        11,
+        21
+    ],
+    "denoise": {
+        "steps": 6,
+        "reveal": {
+            "k": 2,
+            "policy": {
+                "type": "mixture",
+                "choices": {
+                    "ar_force": 0.3,
+                    "greedy": 0.7
+                }
+            }
+        },
+        "decode": {
+            "policy": {
+                "type": "mixture",
+                "choices": {
+                    "fix": 0.6,
+                    "greedy_threshold": 0.4
+                }
+            },
+            "fix_k": 2,
+            "max_k": 3,
+            "min_k": 1,
+            "confidence_threshold": 0.9
+        }
+    },
+    "detach_recurrence": {
+        "enabled": true,
+        "every_r_steps": 1
+    },
+    "inference": {
+        "enabled": true,
+        "every_n_epochs": 1,
+        "fail_on_error": false,
+        "output_root": "evals_results",
+        "evals": [
+            {
+                "name": "gsm8k",
+                "task": "gsm8k",
+                "num_fewshot": 0,
+                "gen_length": 512,
+                "batch_size": 1,
+                "limit": 100,
+                "show_speed": true,
+                "log_samples": false,
+                "prompt_prefix": "Solve the following math problem. Make sure to put the answer (and only answer) inside \\boxed{}.\n\n",
+                "prompt_suffix": ""
+            },
+            {
+                "name": "math",
+                "task": "hendrycks_math500",
+                "num_fewshot": 0,
+                "gen_length": 512,
+                "batch_size": 1,
+                "limit": 100,
+                "show_speed": true,
+                "log_samples": false,
+                "prompt_prefix": "Solve the following math problem. Make sure to put the answer (and only answer) inside \\boxed{}.\n\n",
+                "prompt_suffix": ""
+            }
+        ]
+    }
+}

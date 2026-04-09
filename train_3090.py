@@ -275,7 +275,7 @@ def build_eval_model_args(ckpt_path: str, block_size: int, think_device1: str, t
         "prompt_prefix": str(eval_cfg.get("prompt_prefix", "")),
         "prompt_suffix": str(eval_cfg.get("prompt_suffix", "")),
     }
-    return ",".join(f"{k}={v}" for k, v in model_args.items())
+    return json.dumps(model_args)
 
 
 def run_inference_suite(train_config: dict, savedir: str, state_dir: str, epoch: int, think_device1: str, think_device2: str, talk_device: str):
