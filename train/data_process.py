@@ -116,6 +116,26 @@ def build_dataset_rank(
 
         return out_paths, out_splits
 
+    def _expand_special_aligned_values(
+        paths_in: List[str],
+        values_in: Optional[List[float]],
+    ) -> Optional[List[float]]:
+        if values_in is None:
+            return None
+        if len(paths_in) != len(values_in):
+            raise ValueError(
+                f"aligned values length ({len(values_in)}) must match original datapaths length ({len(paths_in)})."
+            )
+
+        out_values: List[float] = []
+        for datapath, value in zip(paths_in, values_in):
+            repo_id, config = _parse_hf_id(datapath)
+            if repo_id == "EleutherAI/hendrycks_math" and config is None:
+                out_values.extend([value] * len(HENDRYCKS_MATH_CONFIGS))
+            else:
+                out_values.append(value)
+        return out_values
+
     def _parse_percent_list(v: Optional[str], n: int, name: str) -> Optional[List[float]]:
         if v is None:
             return None
@@ -557,13 +577,23 @@ def build_dataset_rank(
             "or splits must provide exactly one value."
         )
 
-    paths, all_splits = _expand_special_datapaths(paths, all_splits)
+    original_paths = list(paths)
+    train_pcts = _parse_percent_list(train_subset_percents, len(original_paths), "train_subset_percents")
+    test_pcts = _parse_percent_list(test_subset_percents, len(original_paths), "test_subset_percents")
+    train_offsets = _parse_percent_list(train_subset_offsets, len(original_paths), "train_subset_offsets")
+    test_offsets = _parse_percent_list(test_subset_offsets, len(original_paths), "test_subset_offsets")
+    think_drop_pcts = _parse_percent_list(
+        assistant_think_drop_probs,
+        len(original_paths),
+        "assistant_think_drop_probs",
+    )
 
-    train_pcts = _parse_percent_list(train_subset_percents, len(paths), "train_subset_percents")
-    test_pcts = _parse_percent_list(test_subset_percents, len(paths), "test_subset_percents")
-    train_offsets = _parse_percent_list(train_subset_offsets, len(paths), "train_subset_offsets")
-    test_offsets = _parse_percent_list(test_subset_offsets, len(paths), "test_subset_offsets")
-    think_drop_pcts = _parse_percent_list(assistant_think_drop_probs, len(paths), "assistant_think_drop_probs")
+    paths, all_splits = _expand_special_datapaths(paths, all_splits)
+    train_pcts = _expand_special_aligned_values(original_paths, train_pcts)
+    test_pcts = _expand_special_aligned_values(original_paths, test_pcts)
+    train_offsets = _expand_special_aligned_values(original_paths, train_offsets)
+    test_offsets = _expand_special_aligned_values(original_paths, test_offsets)
+    think_drop_pcts = _expand_special_aligned_values(original_paths, think_drop_pcts)
     use_explicit_subset_percents = (
         (train_pcts is not None)
         or (test_pcts is not None)
