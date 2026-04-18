@@ -82,7 +82,26 @@ def load_ckpt(state_dir, model, optimizer=None, scheduler=None, map_location="cp
     # 1) talk model
     if "talk_model" not in ckpt:
         raise KeyError(f"ckpt missing 'talk_model': {ckpt_path}")
-    model.talk_model.load_state_dict(ckpt["talk_model"], strict=strict_talk)
+    talk_state = ckpt["talk_model"]
+    talk_state_keys = set(talk_state.keys())
+    model_talk_keys = set(model.talk_model.state_dict().keys())
+    missing_talk_keys = sorted(model_talk_keys - talk_state_keys)
+
+    allow_missing_talk_keys = {"rps_eta_param"}
+    missing_only_allowed = bool(missing_talk_keys) and set(missing_talk_keys).issubset(allow_missing_talk_keys)
+    effective_strict_talk = strict_talk and not missing_only_allowed
+
+    missing, unexpected = model.talk_model.load_state_dict(talk_state, strict=effective_strict_talk)
+    if missing_only_allowed:
+        print(
+            "[CKPT][WARN] talk_model checkpoint is missing backward-compatible keys; "
+            "keeping current init for: "
+            + ", ".join(missing_talk_keys)
+        )
+    elif missing:
+        print(f"[CKPT][WARN] talk_model missing keys: {len(missing)}")
+    if unexpected:
+        print(f"[CKPT][WARN] talk_model unexpected keys: {len(unexpected)}")
 
     # optional: talk lm_head params (newer checkpoints)
     if "talk_lm_head_weight" in ckpt and hasattr(model, "talk_lm_head_weight") and model.talk_lm_head_weight is not None:

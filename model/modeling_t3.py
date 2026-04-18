@@ -519,6 +519,7 @@ class TalkModel(nn.Module):
         self.rps_post_norm = LayerNorm.build(config)  # in __init__
         self.rps_mlp_in = nn.Linear(config.d_model, config.d_model)
         self.rps_mlp_out = nn.Linear(config.d_model, config.d_model)
+        self.rps_eta_param = nn.Parameter(torch.tensor(0.2, dtype=torch.float32))
         # When `init_device="meta"` FSDP will call `reset_parameters()` to initialize weights.
         if init_params:# and self.config.init_device != "meta":
             manual_init_talk_model(self, self.config)
@@ -824,6 +825,7 @@ class TalkModel(nn.Module):
         if rps_cfg["enabled"] and output_hidden_states:
             source_layer = int(rps_cfg.get("source_layer", -1))
             use_mlp = bool(rps_cfg.get("use_mlp", False))
+            learnable_eta = bool(rps_cfg.get("learnable_eta", False))
 
             if source_layer == -1 or len(block_hidden_states) == 0:
                 src_hidden = decode_hidden
@@ -840,7 +842,15 @@ class TalkModel(nn.Module):
 
             rps_in = self.rps_norm(input_repres)
             gate = torch.sigmoid(self.rps_gate(src_hidden))
-            rps_next = rps_in + rps_cfg["eta"] * gate * update_hidden
+            if learnable_eta:
+                eta = self.rps_eta_param.to(dtype=update_hidden.dtype, device=update_hidden.device)
+            else:
+                eta = torch.tensor(
+                    float(rps_cfg.get("eta", 0.2)),
+                    dtype=update_hidden.dtype,
+                    device=update_hidden.device,
+                )
+            rps_next = rps_in + eta * gate * update_hidden
             # keep in same space
             rps_next = self.rps_post_norm(rps_next)
             all_hidden_states.append(rps_next)
