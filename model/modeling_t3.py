@@ -863,117 +863,71 @@ class T3Model(nn.Module):
         self,
         config: dict,
         dtype: torch.dtype = torch.bfloat16,
-        device_map: str | dict = "auto",
         train: bool = True,
-        think_dev1: str = "cuda:1",
-        think_dev2: str = "cuda:2",
-        talk_dev: str = "cuda:0"
+        device: str | torch.device = "cuda",
     ):
         super().__init__()
-        
-        self.is_training_mode = train
-        self.think_dev1 = think_dev1
-        self.think_dev2 = think_dev2
-        self.talk_dev = talk_dev
-        self.device = self.think_dev1
-        self.train_lm_head_enabled = bool(config.get("train_lm_head", {}).get("enabled", False))
 
-        device_map = None
+        self.is_training_mode = train
+        self.device = torch.device(device)
+        self.train_lm_head_enabled = bool(config.get("train_lm_head", {}).get("enabled", False))
 
         # Length
         self.length = config["length"]
 
         # Think model
         self.architecture = self._register(config["pretrained_model_name_or_path"])
-        self.think_model = self._load_model(config["pretrained_model_name_or_path"],dtype=dtype, device_map=device_map)
+        self.think_model = self._load_model(config["pretrained_model_name_or_path"], dtype=dtype, device_map=None)
         if config["lora"]["enabled"]:
             self._add_lora(config.get("lora", {}))
             self.think_model_root = self.think_model.base_model.model
         else:
             self.think_model_root = self.think_model
-        # self.think_model.to(self.think_dev1)
-        self._configure_think_pipeline(config)
-        self.think_model_root.model.move_blocks()
+        self.think_model.to(self.device)
         self.think_model_root.model.set_recorded_hidden_index(config["mix_indexes"])
 
         # Talk model
         talk_config = LLaDAModelConfig(**config["talk_model"])
-        talk_config.init_device = "cpu" 
+        talk_config.init_device = "cpu"
         self.talk_model = TalkModel(talk_config)
-        self.talk_model.to(self.talk_dev)
+        self.talk_model.to(self.device)
 
         # structure
         self.rps_residual = config["rps_residual"]
 
-        # For train / inference efficient
-        if self.think_dev1 != self.talk_dev or self.think_dev2 != self.talk_dev:
-            # copy embed
-            if self.architecture == "Qwen3":
-                self.talk_embed_weight = self.think_model_root.model.embed_tokens.weight.detach()
-            if self.architecture == "LLaDA":
-                self.talk_embed_weight = self.think_model_root.model.transformer.wte.weight.detach() 
-            # copy lm head
-            base_lm_head_bias = None
-            if self.architecture == "Qwen3":
-                base_lm_head_weight = self.think_model_root.lm_head.weight.detach()
-                if self.think_model_root.lm_head.bias is not None:
-                    base_lm_head_bias = self.think_model_root.lm_head.bias.detach()                
-            if self.architecture == "LLaDA":
-                base_lm_head_weight = self.think_model_root.model.transformer.ff_out.weight.detach()
-                if self.think_model_root.model.transformer.ff_out.bias is not None:
-                    base_lm_head_bias = self.think_model_root.model.transformer.ff_out.bias.detach()
-            # assign to talk model
-            self.talk_embed_weight = self.talk_embed_weight.to(self.talk_dev)
-            if self.train_lm_head_enabled:
-                self.talk_lm_head_weight = nn.Parameter(base_lm_head_weight.to(self.talk_dev).clone())
-                self.talk_lm_head_bias = (
-                    None if base_lm_head_bias is None
-                    else nn.Parameter(base_lm_head_bias.to(self.talk_dev).clone())
-                )
-            else:
-                self.talk_lm_head_weight = base_lm_head_weight.to(self.talk_dev)
-                self.talk_lm_head_bias = None if base_lm_head_bias is None else base_lm_head_bias.to(self.talk_dev)
-        else: 
-            if self.architecture == "Qwen3":
-                base_embed_weight = self.think_model_root.model.embed_tokens.weight
-                base_lm_head_weight = self.think_model_root.lm_head.weight
-                base_lm_head_bias = self.think_model_root.lm_head.bias
-            if self.architecture == "LLaDA":
-                base_embed_weight = self.think_model_root.model.transformer.wte.weight
-                base_lm_head_weight = self.think_model_root.model.transformer.ff_out.weight
-                base_lm_head_bias = self.think_model_root.model.transformer.ff_out.bias
+        # Shared embed + lm_head — think and talk live on the same device, so we
+        # alias by reference (no copy) unless train_lm_head is enabled.
+        if self.architecture == "Qwen3":
+            base_embed_weight = self.think_model_root.model.embed_tokens.weight
+            base_lm_head_weight = self.think_model_root.lm_head.weight
+            base_lm_head_bias = self.think_model_root.lm_head.bias
+        elif self.architecture == "LLaDA":
+            base_embed_weight = self.think_model_root.model.transformer.wte.weight
+            base_lm_head_weight = self.think_model_root.model.transformer.ff_out.weight
+            base_lm_head_bias = self.think_model_root.model.transformer.ff_out.bias
+        else:
+            raise ValueError(f"Unknown architecture: {self.architecture}")
 
-            self.talk_embed_weight = base_embed_weight
-            if self.train_lm_head_enabled:
-                self.talk_lm_head_weight = nn.Parameter(base_lm_head_weight.detach().to(self.talk_dev).clone())
-                self.talk_lm_head_bias = (
-                    None if base_lm_head_bias is None
-                    else nn.Parameter(base_lm_head_bias.detach().to(self.talk_dev).clone())
-                )
-            else:
-                self.talk_lm_head_weight = base_lm_head_weight
-                self.talk_lm_head_bias = base_lm_head_bias
+        self.talk_embed_weight = base_embed_weight
+        if self.train_lm_head_enabled:
+            self.talk_lm_head_weight = nn.Parameter(base_lm_head_weight.detach().clone())
+            self.talk_lm_head_bias = (
+                None if base_lm_head_bias is None
+                else nn.Parameter(base_lm_head_bias.detach().clone())
+            )
+        else:
+            self.talk_lm_head_weight = base_lm_head_weight
+            self.talk_lm_head_bias = base_lm_head_bias
 
         # Actions for limited memory resource
         if self.architecture == "LLaDA":
-            if hasattr(self.think_model_root.model.transformer, "ff_out") and self.think_dev2 != self.talk_dev:
-                del self.think_model_root.model.transformer.ff_out
             self.prune_llada_last_n_blocks(config["prune_last_n_layer"])
             from model.LLaDA.configuration_llada import ActivationCheckpointingStrategy
             self.think_model_root.model.set_activation_checkpointing(
                 ActivationCheckpointingStrategy.whole_layer
             )
 
-        # Handling Device
-        # if self.is_training_mode:
-        # self.think_model.to(self.think_dev)
-        # self.talk_model.to(self.talk_dev)
-        # self.talk_embed_weight = self.talk_embed_weight.to(self.talk_dev)
-        # self.talk_lm_head_weight = self.talk_lm_head_weight.to(self.talk_dev)
-        # if self.talk_lm_head_bias is not None:
-        #     self.talk_lm_head_bias = self.talk_lm_head_bias.to(self.talk_dev)
-        
-        dt  = next(self.think_model.parameters()).dtype
+        dt = next(self.think_model.parameters()).dtype
         self.talk_model.to(dtype=dt)
         if isinstance(self.talk_lm_head_weight, nn.Parameter):
             self.talk_lm_head_weight.data = self.talk_lm_head_weight.data.to(dtype=dt)
@@ -983,47 +937,7 @@ class T3Model(nn.Module):
             self.talk_lm_head_bias.data = self.talk_lm_head_bias.data.to(dtype=dt)
         elif self.talk_lm_head_bias is not None and isinstance(self.talk_lm_head_bias, torch.Tensor):
             self.talk_lm_head_bias = self.talk_lm_head_bias.to(dtype=dt)
-        # print_param_devices(self.think_model)
-        # print_param_devices(self.talk_model)
 
-    def _resolve_think_device_alias(self, dev: str) -> str:
-        alias_map = {
-            "think_device1": self.think_dev1,
-            "think_device2": self.think_dev2,
-            "talk_device": self.talk_dev,
-        }
-        return alias_map.get(dev, dev)
-
-    def _configure_think_pipeline(self, config: dict) -> None:
-        split_cfg = config.get("think_split", {}) or {}
-        manual_enabled = bool(split_cfg.get("enabled", split_cfg.get("manual_assign", False)))
-
-        if manual_enabled:
-            split_points = split_cfg.get("split_points", None)
-            if split_points is None and split_cfg.get("split_layer", None) is not None:
-                split_points = [split_cfg["split_layer"]]
-            if split_points is None:
-                raise ValueError("think_split is enabled, but split_points/split_layer is missing.")
-            split_points = [int(x) for x in split_points]
-            if split_points != sorted(split_points):
-                raise ValueError(f"think_split.split_points must be sorted, got: {split_points}")
-
-            devices_cfg = split_cfg.get("devices", ["think_device1", "think_device2"])
-            devices = tuple(self._resolve_think_device_alias(str(d)) for d in devices_cfg)
-            print(f"[ThinkSplit] manual split_points={split_points}, devices={devices}")
-            self.think_model_root.model.set_pipeline(split_points=tuple(split_points), devices=devices)
-            return
-
-        legacy_split = config.get("lora", {}).get("start_layer", None)
-        if legacy_split is None:
-            n_layers = int(getattr(self.think_model_root.config, "n_layers"))
-            legacy_split = n_layers // 2
-            print(f"[ThinkSplit] lora.start_layer missing, fallback split at middle layer: {legacy_split}")
-        self.think_model_root.model.set_pipeline(
-            split_points=(int(legacy_split),),
-            devices=(self.think_dev1, self.think_dev2),
-        )
-    
     def prune_llada_last_n_blocks(self, n_remove: int):
         """
         Remove the last `n_remove` transformer blocks.

@@ -1250,12 +1250,10 @@ class LLaDAModel(nn.Module):
         else:
             past_length = past_key_values[0][0].size(-2)
 
-        devs = self._pipe_devs
         # Get embeddings of input.
         # shape: (batch_size, seq_len, d_model)
         x = self.transformer.wte(input_ids) if input_embeddings is None else input_embeddings  # type: ignore
-        x = x.to(devs[0])
-        
+
         if self.config.input_emb_norm:
             x = x * (self.config.d_model**0.5)
 
@@ -1321,64 +1319,38 @@ class LLaDAModel(nn.Module):
         # decoder layers
         all_hidden_states = []
 
-        cuts = [0] + self._pipe_splits + [len(self.transformer.blocks)]
+        # Apply blocks one-by-one.
+        if self.config.block_group_size == 1:
+            for block_idx, block in enumerate(self.transformer.blocks):
+                if output_hidden_states and (block_idx in self._collected_index):
+                    all_hidden_states.append(x)
 
-        # inside forward, before running blocks:
-        for seg_id in range(len(cuts)-1):
-            s, e = cuts[seg_id], cuts[seg_id+1]
-            dev = devs[seg_id]
-            
-            if x.device != torch.device(dev):
-                x = x.to(dev)
-                if attention_bias is not None:
-                    attention_bias = attention_bias.to(dev)
-
-            if position_ids is not None and position_ids.device != torch.device(dev):
-                position_ids = position_ids.to(dev)
-
-            # Apply blocks one-by-one.
-            if self.config.block_group_size == 1:
-                for block_idx in range(s, e): #enumerate(self.transformer.blocks):
-                    block = self.transformer.blocks[block_idx]
-
-                    if output_hidden_states and (block_idx in self._collected_index):
-                        # add hidden states
-                        all_hidden_states.append(x)
-
-                    layer_past = None if past_key_values is None else past_key_values[block_idx]
-                    if layer_past is not None:
-                        pk, pv = layer_past
-                        if pk.device != x.device:
-                            layer_past = (pk.to(x.device, non_blocking=True), pv.to(x.device, non_blocking=True))
-                    if (
-                        (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
-                        or (
-                            self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
-                            and block_idx % 2 == 0
-                        )
-                        or (
-                            self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
-                            and block_idx % 3 == 0
-                        )
-                        or (
-                            self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
-                            and block_idx % 4 == 0
-                        )
-                    ):
-                        # shape: (batch_size, seq_len, d_model)
-                        x, cache = self._activation_checkpoint_fn(
-                            block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids
-                        )
-                    else:
-                        # shape: (batch_size, seq_len, d_model)
-                        x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids)
-                    if attn_key_values is not None:
-                        assert cache is not None
-                        ck, cv = cache
-                        # make sure it stays on the current block device
-                        attn_key_values.append((ck.to(x.device, non_blocking=True), cv.to(x.device, non_blocking=True)))
-            else:
-                raise NotImplementedError("currently force group size = 1")
+                layer_past = None if past_key_values is None else past_key_values[block_idx]
+                if (
+                    (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
+                    or (
+                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
+                        and block_idx % 2 == 0
+                    )
+                    or (
+                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
+                        and block_idx % 3 == 0
+                    )
+                    or (
+                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
+                        and block_idx % 4 == 0
+                    )
+                ):
+                    x, cache = self._activation_checkpoint_fn(
+                        block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids
+                    )
+                else:
+                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids)
+                if attn_key_values is not None:
+                    assert cache is not None
+                    attn_key_values.append(cache)
+        else:
+            raise NotImplementedError("currently force group size = 1")
             
         if last_logits_only:
             # shape: (batch_size, 1, d_model)
@@ -1402,54 +1374,6 @@ class LLaDAModel(nn.Module):
         logits = None
 
         return LLaDAOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
-
-    # Added functions
-    def set_pipeline(self, split_points=(20,), devices=("cuda:1", "cuda:2")):
-        # split_points define ranges: [0:s0], [s0:s1], ..., [last:n_layers]
-        self._pipe_splits = list(split_points)
-        self._pipe_devs = list(devices)
-
-        # sanity: need exactly len(splits)+1 devices
-        if len(self._pipe_devs) != len(self._pipe_splits) + 1:
-            raise ValueError(
-                f"Need len(devices)=len(split_points)+1, got {len(self._pipe_devs)} vs {len(self._pipe_splits)+1}"
-            )
-
-    def move_block_range(self, start, end, device):
-        if start >= end:
-            return
-
-        if self.config.block_group_size == 1:
-            # blocks exist
-            for i in range(start, end):
-                self.transformer.blocks[i].to(device)
-        else:
-            g = self.config.block_group_size
-            g0 = start // g
-            g1 = (end - 1) // g
-            for gi in range(g0, g1 + 1):
-                self.transformer.block_groups[gi].to(device)
-
-    def move_blocks(self):
-        n_layers = self.config.n_layers
-
-        # build segment boundaries: [0, s0, s1, ..., n_layers]
-        cuts = [0] + self._pipe_splits + [n_layers]
-
-        for seg_id in range(len(cuts) - 1):
-            start, end = cuts[seg_id], cuts[seg_id + 1]
-            dev = self._pipe_devs[seg_id]
-            self.move_block_range(start, end, dev)
-
-        # also move embeddings + ln_f to the first/last stage (recommended)
-        self.transformer.wte.to(self._pipe_devs[0])
-        self.transformer.emb_drop.to(self._pipe_devs[0])
-        self.transformer.ln_f.to(self._pipe_devs[-1])
-
-        if hasattr(self.transformer, "wpe"):
-            self.transformer.wpe.to(self._pipe_devs[0])
-        if hasattr(self.transformer, "ff_out"):
-            self.transformer.ff_out.to(self._pipe_devs[-1])
 
     def set_recorded_hidden_index(self, indexes):
         self._collected_index = set(indexes)

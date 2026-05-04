@@ -238,9 +238,9 @@ class _BaseT3EvalHarness(LM):
         gen_length=256,
         block_size=8,
         device="cuda",
-        think_device1="cuda:0",
-        think_device2="cuda:0",
-        talk_device="cuda:0",
+        think_device1=None,
+        think_device2=None,
+        talk_device=None,
         save_dir=None,
         show_speed=False,
         prompt_prefix="",
@@ -274,9 +274,11 @@ class _BaseT3EvalHarness(LM):
         self.prompt_prefix = prompt_prefix
         self.prompt_suffix = prompt_suffix
 
-        self.think_device1 = think_device1
-        self.think_device2 = think_device2
-        self.talk_device = talk_device
+        # The eval_t3.sh CLI surface still ships separate think_device1 / think_device2
+        # / talk_device kwargs; under the single-device refactor we collapse them onto
+        # one device. talk_device wins if multiple are provided.
+        resolved_device = talk_device or think_device1 or think_device2 or device
+        self.device = str(resolved_device)
 
         # Load model config from checkpoint
         config_path = os.path.join(ckpt_path, "config.json")
@@ -309,15 +311,10 @@ class _BaseT3EvalHarness(LM):
         self.model = self.MODEL_CLS(
             self.model_config,
             train=False,
-            think_dev1=think_device1,
-            think_dev2=think_device2,
-            talk_dev=talk_device,
+            device=self.device,
         )
         self.model.eval()
         load_ckpt(ckpt_path, self.model, None, None, map_location="cpu")
-        self.think_device1 = self.model.think_dev1
-        self.think_device2 = self.model.think_dev2
-        self.talk_device = self.model.talk_dev
 
         # Use the training-time denoise schedule when available.
         # model.length is the block size copied from training config.
@@ -361,7 +358,7 @@ class _BaseT3EvalHarness(LM):
     def t3_generate(self, input_ids):
         """
         Block-wise generation using T3 model (single-sample path, aligned with inference.py).
-        input_ids: [1, seq_len] prompt token ids on think_device1
+        input_ids: [1, seq_len] prompt token ids on `self.device`
         Returns: ([1, seq_len + gen_length] full sequence, nfe count)
         """
         B = input_ids.shape[0]
@@ -371,19 +368,19 @@ class _BaseT3EvalHarness(LM):
         max_len = seq_len + self.gen_length
 
         x = torch.full(
-            (B, max_len), self.mask_id, dtype=torch.long, device=self.think_device1
+            (B, max_len), self.mask_id, dtype=torch.long, device=self.device
         )
         x[:, :seq_len] = input_ids
 
         # Position ids
-        position_ids = torch.arange(0, max_len, device=self.think_device1).unsqueeze(0).expand(B, -1)
+        position_ids = torch.arange(0, max_len, device=self.device).unsqueeze(0).expand(B, -1)
 
         # Attention mask (all ones)
-        attention_mask = torch.ones(B, max_len, dtype=torch.bool, device=self.think_device1)
+        attention_mask = torch.ones(B, max_len, dtype=torch.bool, device=self.device)
 
         # Build block attention bias (bool, [max_len, max_len])
         attention_bias = torch.zeros(
-            (max_len, max_len), dtype=torch.bool, device=self.think_device1
+            (max_len, max_len), dtype=torch.bool, device=self.device
         )
         # Prompt attends to prompt
         attention_bias[:seq_len, :seq_len] = True
@@ -441,21 +438,13 @@ class _BaseT3EvalHarness(LM):
                 talk_input_ids = x0[:, -self.block_size:]
                 talk_rps = think_rps[:, -self.block_size:, :]
 
-            if self.think_device2 != self.talk_device:
-                talk_input_ids = talk_input_ids.to(self.talk_device)
-                talk_rps = talk_rps.to(self.talk_device)
-
-            talk_attn_mask = torch.ones_like(
-                talk_input_ids, dtype=torch.long, device=self.talk_device
-            )
+            talk_attn_mask = torch.ones_like(talk_input_ids, dtype=torch.long)
             talk_attn_bias = torch.zeros(
                 (1, 1, self.block_size, self.block_size),
-                device=self.talk_device,
+                device=self.device,
                 dtype=torch.float32,
             )
-            loss_mask = torch.ones_like(
-                talk_attn_mask, dtype=torch.float32, device=self.talk_device
-            )
+            loss_mask = torch.ones_like(talk_attn_mask, dtype=torch.float32)
 
             talk_input_embeds = F.embedding(talk_input_ids, self.model.talk_embed_weight)
 
@@ -503,9 +492,6 @@ class _BaseT3EvalHarness(LM):
                     talk_input_embeds = F.embedding(talk_input_ids, self.model.talk_embed_weight)
 
             # After denoise loop: update x and prepare next block
-            if self.talk_device != self.think_device1:
-                talk_input_ids = talk_input_ids.to(self.think_device1)
-
             x[:, s:e] = talk_input_ids
 
             # Prepare next block input
@@ -568,8 +554,8 @@ class _BaseT3EvalHarness(LM):
         This uses the base LLaDA model's bidirectional attention for MC estimation.
         """
         seq = torch.cat([prefix, target])[None, :]
-        seq = seq.repeat((self.batch_size, 1)).to(self.think_device1)
-        prompt_index = torch.arange(seq.shape[1], device=self.think_device1) < len(prefix)
+        seq = seq.repeat((self.batch_size, 1)).to(self.device)
+        prompt_index = torch.arange(seq.shape[1], device=self.device) < len(prefix)
 
         loss_acc = []
         for _ in range(self.mc_num // self.batch_size):
@@ -663,7 +649,7 @@ class _BaseT3EvalHarness(LM):
             ).input_ids[0]
 
             prompt_len = int(ids_1d.shape[0])
-            input_batch = ids_1d.unsqueeze(0).to(self.think_device1)
+            input_batch = ids_1d.unsqueeze(0).to(self.device)
 
             generated, nfe = self.t3_generate(input_batch)
             total_nfe += nfe

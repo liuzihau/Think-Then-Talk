@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Single-process, pure PyTorch training:
-- thought model (frozen, no_grad) on THINK_DEVICE
-- talking_ml (trainable) on TALK_DEVICE
-- manual warmup+linear decay LR scheduler (DeepSpeed WarmupDecayLR equivalent)
-- safe device handling for masks / indexing
-- PyTorch-style checkpoint saving (talk_model + optimizer + scheduler + meta)
+Single-device T3 training, wrapped with 🤗 Accelerate.
+Single-GPU is plain `accelerator.prepare()`; 2-GPU is the same code launched
+with `--num_processes=2` (DDP). No DeepSpeed, no ZeRO, no FSDP.
 """
 
 import os, re, json, inspect, subprocess, sys
@@ -19,6 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
 from transformers import AutoTokenizer
+from accelerate import Accelerator
 from accelerate.utils import set_seed
 from tqdm import tqdm
 
@@ -263,14 +261,17 @@ def append_jsonl(path: str, payload: dict):
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def build_eval_model_args(ckpt_path: str, block_size: int, think_device1: str, think_device2: str, talk_device: str, eval_cfg: dict):
+def build_eval_model_args(ckpt_path: str, block_size: int, device: str, eval_cfg: dict):
+    # eval_t3.py still accepts the legacy think_device1/think_device2/talk_device
+    # kwargs for CLI surface compatibility; we route all three to the same device.
+    device_str = str(eval_cfg.get("device", device))
     model_args = {
         "ckpt_path": ckpt_path,
         "gen_length": int(eval_cfg.get("gen_length", 512)),
         "block_size": int(eval_cfg.get("block_size", block_size)),
-        "think_device1": str(eval_cfg.get("think_device1", think_device1)),
-        "think_device2": str(eval_cfg.get("think_device2", think_device2)),
-        "talk_device": str(eval_cfg.get("talk_device", talk_device)),
+        "think_device1": device_str,
+        "think_device2": device_str,
+        "talk_device": device_str,
         "show_speed": bool(eval_cfg.get("show_speed", True)),
         "prompt_prefix": str(eval_cfg.get("prompt_prefix", "")),
         "prompt_suffix": str(eval_cfg.get("prompt_suffix", "")),
@@ -278,7 +279,7 @@ def build_eval_model_args(ckpt_path: str, block_size: int, think_device1: str, t
     return json.dumps(model_args)
 
 
-def run_inference_suite(train_config: dict, savedir: str, state_dir: str, epoch: int, think_device1: str, think_device2: str, talk_device: str):
+def run_inference_suite(train_config: dict, savedir: str, state_dir: str, epoch: int, device: str):
     inference_cfg = train_config.get("inference", {})
     if not inference_cfg.get("enabled", False):
         return
@@ -321,9 +322,7 @@ def run_inference_suite(train_config: dict, savedir: str, state_dir: str, epoch:
             build_eval_model_args(
                 ckpt_path=state_dir,
                 block_size=train_config["data"]["block_size"],
-                think_device1=think_device1,
-                think_device2=think_device2,
-                talk_device=talk_device,
+                device=device,
                 eval_cfg=eval_cfg,
             ),
             "--tasks",
@@ -436,9 +435,9 @@ def denoise_k_step(
     generator=None,
 ):
     """
-    input_ids: [BG, L] on TALK_DEVICE
-    target:    [BG, L] on TALK_DEVICE
-    loss_mask: [BG, L] on TALK_DEVICE (0/1 float or bool)
+    input_ids: [BG, L]
+    target:    [BG, L]
+    loss_mask: [BG, L] (0/1 float or bool)
     """
     reveal_cfg = {"k": int(k), "policy": mode}
     input_ids, loss_mask, _, _ = denoise_k_step_hard(
@@ -574,14 +573,9 @@ def main():
     parser.add_argument("--savedir", type=str, default="0")
     parser.add_argument("--training_config", type=str, default="train/train_config.json")
     parser.add_argument("--model_config", type=str, default="model/config.json")
-    parser.add_argument("--think_device1", type=str, default="cuda:2")
-    parser.add_argument("--think_device2", type=str, default="cuda:3")
-    parser.add_argument("--talk_device", type=str, default="cuda:1")
+    parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
-    
-    THINK_DEVICE1 = args.think_device1
-    THINK_DEVICE2 = args.think_device2
-    TALK_DEVICE = args.talk_device
+
     VIS_EVERY_OPT_STEP = 2000     # optimiser steps
     VIS_MAX_STEPS = 16            # denoise steps to print (avoid huge logs)
     VIS_BIDX = 0                  # which sample in batch
@@ -599,7 +593,7 @@ def main():
     training_parameters = AttrDict(train_config["training_parameters"])
     with open(args.model_config) as f:
         model_config = json.load(f)
-    
+
     # copy model related parameter from train_config
     model_config["train_dataset"] = train_config["data"]["train_dataset"]
     model_config["length"] = train_config["data"]["block_size"]
@@ -607,8 +601,6 @@ def main():
     model_config["talk_model"]["n_layers"] = train_config["talk_model"]["n_layers"]
     model_config["mix_indexes"] = train_config["mix_indexes"]
     model_config["denoise"] = train_config["denoise"]
-    if "think_split" in train_config:
-        model_config["think_split"] = train_config["think_split"]
     if "train_lm_head" in train_config:
         model_config["train_lm_head"] = train_config["train_lm_head"]
     if train_config["lora"]["enabled"]:
@@ -617,6 +609,16 @@ def main():
         model_config['rps_residual'] = train_config['rps_residual']
     if train_config['soft_inputs']['enabled']:
         model_config['soft_inputs'] = train_config['soft_inputs']
+
+    # -------------------------
+    # Accelerator
+    # -------------------------
+    accelerator = Accelerator(
+        mixed_precision="bf16",
+        gradient_accumulation_steps=int(train_config.get("gradient_accumulation_steps", 1)),
+    )
+    device = accelerator.device
+
     # -------------------------
     # Model
     # -------------------------
@@ -624,7 +626,7 @@ def main():
         args.savedir = f'{training_parameters["wandb_name"]}-{train_config["data"]["block_size"]}-{train_config["data"]["block_num"]}-{train_config["gradient_accumulation_steps"]}'
     os.makedirs(args.savedir, exist_ok=True)
 
-    model = T3Model(model_config, think_dev1=THINK_DEVICE1, think_dev2=THINK_DEVICE2, talk_dev=TALK_DEVICE)
+    model = T3Model(model_config, device=device)
 
     freeze_parameters(model)
 
@@ -757,11 +759,10 @@ def main():
         param_groups,
         betas=betas,
     )
-    
+
     grad_accum = int(train_config.get("gradient_accumulation_steps", 1))
     grad_clip = float(train_config.get("gradient_clipping", 0.0) or 0.0)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    
+
     def lr_lambda(step: int):
         if step < warmup_steps:
             return step / max(1, warmup_steps)
@@ -769,14 +770,13 @@ def main():
 
     scheduler = LambdaLR(optimizer, lr_lambda)
 
-    # Load ckpt AFTER optimizer/scheduler exists
+    # Load ckpt AFTER optimizer/scheduler exists, BEFORE accelerator.prepare so the
+    # raw module's state_dict matches the saved keys.
     if ckpt_dir is not None:
-        # load ckpt (map to CPU first; state_dict copy to correct device tensors is handled by optimizer load)
         start_epoch = load_ckpt(ckpt_dir, model, optimizer, scheduler, map_location="cpu")
     else:
         warm_start_dir = resolve_state_dir(init_from_state_dir_cfg, filename="ckpt.pt")
         if warm_start_dir is not None:
-            # Warm-start only model weights, allowing missing/new keys.
             _ = load_ckpt(
                 warm_start_dir,
                 model,
@@ -792,12 +792,22 @@ def main():
         else:
             print("[CKPT] no previous checkpoint found; training from scratch.")
 
+    # Wrap model / optimizer / dataloaders / scheduler with Accelerate. In single-GPU
+    # mode this is mostly a no-op; in 2-GPU DDP mode this wires up gradient sync and
+    # shards the dataloader. `model_raw` keeps a handle on the unwrapped module so we
+    # can reach T3-specific attributes (length, talk_embed_weight, talk_model, ...)
+    # without going through the DDP wrapper.
+    model, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, test_loader, scheduler
+    )
+    model_raw = accelerator.unwrap_model(model)
+
     num_epochs = int(training_parameters["num_epochs"])
 
     # -------------------------
     # WandB (optional)
     # -------------------------
-    use_wandb = True
+    use_wandb = accelerator.is_main_process
     if use_wandb:
         import wandb
         # Do NOT hardcode keys; set WANDB_API_KEY in environment.
@@ -819,37 +829,35 @@ def main():
 
         loss_cfg = train_config.get("loss", {})
 
-        epoch_acces = [[] for _ in range(model.length)]
-        epoch_plosses = [[] for _ in range(model.length)]
-        epoch_certain_losses = [[] for _ in range(model.length)]
-        epoch_certain_accs = [[] for _ in range(model.length)]
-        epoch_decode_losses = [[] for _ in range(model.length)]
-        epoch_decode_accs = [[] for _ in range(model.length)]
+        epoch_acces = [[] for _ in range(model_raw.length)]
+        epoch_plosses = [[] for _ in range(model_raw.length)]
+        epoch_certain_losses = [[] for _ in range(model_raw.length)]
+        epoch_certain_accs = [[] for _ in range(model_raw.length)]
+        epoch_decode_losses = [[] for _ in range(model_raw.length)]
+        epoch_decode_accs = [[] for _ in range(model_raw.length)]
         epoch_clip_flags = []
         epoch_grad_norm_pre = []
         epoch_grad_norm_post = []
 
-        batch_acces = [[] for _ in range(model.length)]
-        batch_plosses = [[] for _ in range(model.length)]
-        batch_certain_losses = [[] for _ in range(model.length)]
-        batch_certain_accs = [[] for _ in range(model.length)]
-        batch_decode_losses = [[] for _ in range(model.length)]
-        batch_decode_accs = [[] for _ in range(model.length)]
+        batch_acces = [[] for _ in range(model_raw.length)]
+        batch_plosses = [[] for _ in range(model_raw.length)]
+        batch_certain_losses = [[] for _ in range(model_raw.length)]
+        batch_certain_accs = [[] for _ in range(model_raw.length)]
+        batch_decode_losses = [[] for _ in range(model_raw.length)]
+        batch_decode_accs = [[] for _ in range(model_raw.length)]
         batch_clip_flags = []
         batch_grad_norm_pre = []
         batch_grad_norm_post = []
-        
-        pbar = tqdm(loader, desc=("train" if train else "test"))
+
+        pbar = tqdm(loader, desc=("train" if train else "test"), disable=not accelerator.is_local_main_process)
         for batch_idx, data in enumerate(pbar):
             do_vis = (train and (global_step % VIS_EVERY_OPT_STEP == 0) and ((batch_idx) % grad_accum == 0))
 
-            # Thought inputs on THINK_DEVICE
-            input_ids_think = data["input_ids"].to(THINK_DEVICE1, non_blocking=True)
-            pos_ids_think = data["position_ids"].to(THINK_DEVICE1, non_blocking=True)
-            attn_think      = data["attention_mask"].to(THINK_DEVICE1, non_blocking=True)
-            bias_think      = data["attention_bias"].to(THINK_DEVICE1, non_blocking=True)
-            # for it in input_ids_think:
-            #     print(tokenizer.decode(it.detach().view(-1).tolist()))
+            # accelerator.prepare(loader) puts batch tensors on `device` already.
+            input_ids_think = data["input_ids"]
+            pos_ids_think   = data["position_ids"]
+            attn_think      = data["attention_mask"]
+            bias_think      = data["attention_bias"]
             # -----------------
             # Think forward
             # -----------------
@@ -863,7 +871,7 @@ def main():
                     use_cache=False,
                     output_hidden_states=True
                 )
-            think_rps = think_outputs.hidden_states  # [B, S+C, H] on THINK_DEVICE
+            think_rps = think_outputs.hidden_states  # [B, S+C, H]
             B = think_rps.size(0)
             H = think_rps.size(-1)
 
@@ -879,26 +887,16 @@ def main():
             # -----------------
             # Talking iterations
             # -----------------
-            # Target on TALK_DEVICE (assumed [B, L] == [B, C])
-            target_talk = data["target"].to(TALK_DEVICE, non_blocking=True)
-            target_talk = target_talk.view(-1, model.length)  #[B * G, L]
-            # Build device-specific masks
-            mask_bool_talk = data["loss_mask"].to(TALK_DEVICE, non_blocking=True).bool()  # [B, S+C]
-            # Build talk input_ids on TALK_DEVICE using talk mask
-            input_ids = input_ids_think.to(TALK_DEVICE)[mask_bool_talk].view(data["input_ids"].size(0), -1)  # [B, L]
-            input_ids = input_ids.view(-1, model.length) #[B * G, L]
-            # Move rps once to TALK_DEVICE
-            rps = think_rps.to(TALK_DEVICE, non_blocking=True)
-            rps = rps[mask_bool_talk].view(B, -1, H)  # [B, L, H]
-            rps = rps.view(-1, model.length, rps.shape[-1])  #[B * G, L]
-            # Build attention mask for talk (all ones) on TALK_DEVICE
-            talk_attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=TALK_DEVICE)
-            talk_attention_mask = talk_attention_mask.view(-1, model.length)  #[B * G, L]
-            talk_bias = torch.zeros((1, 1, model.length, model.length), device=TALK_DEVICE, dtype=torch.float32)
-            # loss mask on TALK_DEVICE, same shape as target_talk ([B, L])
-            loss_mask = torch.ones_like(target_talk, dtype=torch.float32, device=TALK_DEVICE)
-            loss_mask = loss_mask.view(-1, model.length)
-            
+            target_talk = data["target"].view(-1, model_raw.length)  # [B*G, L]
+            mask_bool_talk = data["loss_mask"].bool()                # [B, S+C]
+            input_ids = input_ids_think[mask_bool_talk].view(data["input_ids"].size(0), -1)
+            input_ids = input_ids.view(-1, model_raw.length)         # [B*G, L]
+            rps = think_rps[mask_bool_talk].view(B, -1, H)           # [B, L, H]
+            rps = rps.view(-1, model_raw.length, rps.shape[-1])      # [B*G, L, H]
+            talk_attention_mask = torch.ones_like(input_ids, dtype=torch.long).view(-1, model_raw.length)
+            talk_bias = torch.zeros((1, 1, model_raw.length, model_raw.length), device=device, dtype=torch.float32)
+            loss_mask = torch.ones_like(target_talk, dtype=torch.float32).view(-1, model_raw.length)
+
             if do_vis:
                 input_ids_init_BG_L = input_ids.detach().clone()
                 steps_pred_BG_L = []
@@ -907,8 +905,8 @@ def main():
             # If eval: keep everything in no_grad()
             ctx = torch.enable_grad() if train else torch.no_grad()
             with ctx:
-                input_embeds = F.embedding(input_ids, model.talk_embed_weight)  # initial emb (step 0)
-                for idx in range(model.length):
+                input_embeds = F.embedding(input_ids, model_raw.talk_embed_weight)  # initial emb (step 0)
+                for idx in range(model_raw.length):
                     if not loss_mask.bool().any():
                         break
                     talk_outputs = model(
@@ -923,10 +921,6 @@ def main():
                     logits = talk_outputs.logits.float()
                     rps = talk_outputs.hidden_states
 
-                    # out_logp = F.log_softmax(logits, dim=-1)
-
-                    # loss_i = calculate_ploss(out_logp, target_talk, loss_mask)
-                    # loss_sum_i, count_i = ploss_sum_and_count(out_logp, target_talk, loss_mask)
                     loss_sum_i, count_i = per_step_loss_sum_and_count(
                         loss_cfg=loss_cfg,
                         logits=logits,
@@ -950,18 +944,17 @@ def main():
                     reveal_cfg = get_denoise_reveal_config(denoise_cfg)
                     decode_cfg = get_denoise_decode_config(denoise_cfg, default_k=reveal_cfg["k"])
 
-                    # plosses.append(loss_i)
                     loss_sums.append(loss_sum_i)
                     counts.append(count_i)
                     acces.append(correct / max(1, total))
                     certain_losses.append(certain_loss_i)
                     certain_accs.append(certain_acc_i)
-                    
+
                     if do_vis and idx < VIS_MAX_STEPS:
                         steps_pred_BG_L.append(logits.argmax(dim=-1).detach())  # [B*G, L]
                         steps_mask_BG_L.append(loss_mask.detach())             # [B*G, L]
-                    
-                    # denoise step updates input_ids + loss_mask (both on TALK_DEVICE)
+
+                    # denoise step updates input_ids + loss_mask
                     loss_mask_prev = loss_mask
                     if train_config["soft_inputs"]["enabled"]:
                         soft_cfg = train_config["soft_inputs"]
@@ -970,7 +963,7 @@ def main():
                             target=target_talk,
                             loss_mask=loss_mask,
                             logits=logits,
-                            emb_weight=model.talk_embed_weight,
+                            emb_weight=model_raw.talk_embed_weight,
                             k_reveal=reveal_cfg["k"],
                             soft_topk=soft_cfg["top_k"],
                             soft_temp=soft_cfg["temperature"],
@@ -981,11 +974,10 @@ def main():
                         if ("lam_max" in soft_cfg) or ("lam_min" in soft_cfg):
                             kwargs["lam_max"] = float(soft_cfg.get("lam_max", 0.7))  # sensible default once enabled
                             kwargs["lam_min"] = float(soft_cfg.get("lam_min", 0.0))
-                            # also recommend passing mask_token_id explicitly when enabled
                             mid = getattr(tokenizer, "mask_token_id", None)
                             if mid is not None:
                                 kwargs["mask_token_id"] = mid
-                                
+
                         input_ids, input_embeds, loss_mask = denoise_k_step_soft_embed_v2(**kwargs)
                     else:
                         input_ids, loss_mask = denoise_k_step(
@@ -997,7 +989,7 @@ def main():
                             mode=reveal_cfg.get("policy", "random"),
                             decode_cfg=decode_cfg,
                         )
-                        input_embeds = F.embedding(input_ids, model.talk_embed_weight)  # initial emb (step 0)
+                        input_embeds = F.embedding(input_ids, model_raw.talk_embed_weight)
 
                     revealed_mask = loss_mask_prev.bool() & (~loss_mask.bool())
                     decode_loss_i, decode_acc_i = masked_position_loss_acc(
@@ -1007,26 +999,14 @@ def main():
                     )
                     decode_losses.append(decode_loss_i)
                     decode_accs.append(decode_acc_i)
-                    
+
                     if train_config["detach_recurrence"]["enabled"] and ((idx + 1) % train_config["detach_recurrence"]["every_r_steps"] == 0):
                         rps, input_embeds = detach_state(rps, input_embeds)
-                
-                # Version 1
-                # ploss_weight = [0.8 ** i if i < 10 else 0.8 ** 10 for i in range(len(plosses))]
-                # loss = sum(ploss_weight[i] * plosses[i] for i in range(len(plosses)))
-                
-                # Version 2
-                # w = [0.8 ** i if i < 10 else 0.8 ** 10 for i in range(len(loss_sums))]
-                # w[0] *= max(1, 5 - epoch_num)
-                # weighted_loss_sum = sum(w[i] * loss_sums[i] for i in range(len(loss_sums)))
-                # weighted_count    = sum(w[i] * counts[i]     for i in range(len(counts)))
-                # loss = weighted_loss_sum / weighted_count.clamp_min(1e-6)
 
-                # Version 3
-                w = build_step_weights(loss_cfg, num_steps=len(loss_sums), epoch=epoch_num).to(TALK_DEVICE)
+                w = build_step_weights(loss_cfg, num_steps=len(loss_sums), epoch=epoch_num).to(device)
 
-                weighted_loss_sum = torch.zeros((), device=TALK_DEVICE, dtype=torch.float32)
-                weighted_count    = torch.zeros((), device=TALK_DEVICE, dtype=torch.float32)
+                weighted_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+                weighted_count    = torch.zeros((), device=device, dtype=torch.float32)
 
                 for i in range(len(loss_sums)):
                     weighted_loss_sum = weighted_loss_sum + w[i] * loss_sums[i]
@@ -1036,15 +1016,17 @@ def main():
                 loss = weighted_loss_sum / weighted_count.clamp_min(clamp_min)
 
                 if train:
-                    loss = loss / grad_accum
-                    loss.backward()
-                    
+                    # `accelerator.accumulate` matches the manual `loss / grad_accum`
+                    # pattern: it scales the loss internally and only triggers DDP
+                    # gradient sync on the boundary step.
+                    accelerator.backward(loss / grad_accum)
+
                     if (batch_idx + 1) % grad_accum == 0:
                         clip_flag = 0.0
                         pre_norm = 0.0
                         post_norm = 0.0
                         if grad_clip > 0:
-                            total_norm = torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+                            total_norm = accelerator.clip_grad_norm_(model.parameters(), grad_clip)
                             pre_norm = float(total_norm.item() if torch.is_tensor(total_norm) else total_norm)
                             post_norm = float(min(pre_norm, grad_clip))
                             clip_flag = 1.0 if pre_norm > grad_clip else 0.0
@@ -1092,12 +1074,12 @@ def main():
                     epoch_clip_flags.extend(batch_clip_flags)
                     epoch_grad_norm_pre.extend(batch_grad_norm_pre)
                     epoch_grad_norm_post.extend(batch_grad_norm_post)
-                batch_acces = [[] for _ in range(model.length)]
-                batch_plosses = [[] for _ in range(model.length)]
-                batch_certain_losses = [[] for _ in range(model.length)]
-                batch_certain_accs = [[] for _ in range(model.length)]
-                batch_decode_losses = [[] for _ in range(model.length)]
-                batch_decode_accs = [[] for _ in range(model.length)]
+                batch_acces = [[] for _ in range(model_raw.length)]
+                batch_plosses = [[] for _ in range(model_raw.length)]
+                batch_certain_losses = [[] for _ in range(model_raw.length)]
+                batch_certain_accs = [[] for _ in range(model_raw.length)]
+                batch_decode_losses = [[] for _ in range(model_raw.length)]
+                batch_decode_accs = [[] for _ in range(model_raw.length)]
                 batch_clip_flags = []
                 batch_grad_norm_pre = []
                 batch_grad_norm_post = []
@@ -1294,31 +1276,33 @@ def main():
         # clear cache
         torch.cuda.empty_cache()
 
-        # Save PyTorch checkpoint (talking_ml only + optim/sched)
-        save_ckpt(
-            args.savedir,
-            epoch,
-            model,
-            optimizer,
-            scheduler,
-            extra={
-                "think_device1": THINK_DEVICE1,
-                "think_device2": THINK_DEVICE2,
-                "talk_device": TALK_DEVICE,
-                "global_step": global_step,
-            },
-            model_config=model_config
-        )
-        state_dir = os.path.join(args.savedir, f"state_{epoch}")
-        run_inference_suite(
-            train_config=train_config,
-            savedir=args.savedir,
-            state_dir=state_dir,
-            epoch=epoch,
-            think_device1=THINK_DEVICE1,
-            think_device2=THINK_DEVICE2,
-            talk_device=TALK_DEVICE,
-        )
+        # Save PyTorch checkpoint (talking_ml only + optim/sched).
+        # `accelerator.wait_for_everyone()` syncs ranks before save; only the main
+        # process writes. The unwrapped state_dict matches the pre-DDP key layout,
+        # which keeps existing `load_ckpt` callers working.
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            save_ckpt(
+                args.savedir,
+                epoch,
+                model_raw,
+                optimizer,
+                scheduler,
+                extra={
+                    "device": str(device),
+                    "global_step": global_step,
+                },
+                model_config=model_config
+            )
+            state_dir = os.path.join(args.savedir, f"state_{epoch}")
+            run_inference_suite(
+                train_config=train_config,
+                savedir=args.savedir,
+                state_dir=state_dir,
+                epoch=epoch,
+                device=str(device),
+            )
+        accelerator.wait_for_everyone()
 
     print("\nDone.")
 

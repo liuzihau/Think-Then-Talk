@@ -1,0 +1,9 @@
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: NO            # MULTI_GPU when launched with --num_processes > 1
+mixed_precision: bf16
+num_machines: 1
+num_processes: 1                # overridden by --num_processes on the launch command
+rdzv_backend: static
+same_network: true
+use_cpu: false

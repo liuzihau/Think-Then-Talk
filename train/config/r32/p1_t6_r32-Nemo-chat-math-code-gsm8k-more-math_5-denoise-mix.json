@@ -14,18 +14,6 @@
         "block_num": 90
     },
     "init_from_state_dir": "cfg6-p1-l30-r32-a64-lm-t6-mlp-7.5lr-2-denoise-mix-6-90-2/state_3",
-    "bf16": {
-        "enabled": true
-    },
-    "fp16": {
-        "enabled": false,
-        "auto_cast": "true",
-        "loss_scale": 0,
-        "loss_scale_window": 1000,
-        "initial_scale_power": 14,
-        "hysteresis": 2,
-        "min_loss_scale": 1
-    },
     "optimizer": {
         "type": "AdamW",
         "params": {
@@ -55,21 +43,9 @@
             "total_num_steps": 90000
         }
     },
-    "zero_optimization": {
-        "stage": 2,
-        "stage3_gather_16bit_weights_on_model_save": true,
-        "allgather_partitions": true,
-        "allgather_bucket_size": 200000000.0,
-        "overlap_comm": true,
-        "reduce_scatter": true,
-        "reduce_bucket_size": 200000000.0,
-        "contiguous_gradients": true
-    },
     "gradient_accumulation_steps": 2,
     "gradient_clipping": 0.8,
-    "steps_per_print": 2000,
     "train_micro_batch_size_per_gpu": 1,
-    "wall_clock_breakdown": false,
     "training_parameters": {
         "wandb_name": "cfg6-p1-l30-r32-a64-lm-t6-mlp-7.5lr-5-denoise-mix",
         "bs": 4,
@@ -138,17 +114,6 @@
                 "down_proj"
             ]
         }
-    },
-    "think_split": {
-        "enabled": true,
-        "manual_assign": true,
-        "split_points": [
-            16
-        ],
-        "devices": [
-            "think_device1",
-            "think_device2"
-        ]
     },
     "train_lm_head": {
         "enabled": true
