@@ -1048,6 +1048,7 @@ class T3Model(nn.Module):
         inputs_embeds: Optional[torch.FloatTensor],
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,  # LLaDA
+        block_mask=None,                                # LLaDA + FlexAttention
         position_ids: torch.LongTensor | None = None,  # Qwen3
         past_key_values: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
@@ -1076,6 +1077,7 @@ class T3Model(nn.Module):
                 input_embeddings=inputs_embeds,
                 attention_mask=attention_mask,
                 attention_bias=attention_bias,
+                block_mask=block_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -1146,6 +1148,7 @@ class T3Model(nn.Module):
         inputs_repres: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
+        block_mask=None,
         position_ids: torch.LongTensor | None = None,  # Qwen3
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -1154,9 +1157,8 @@ class T3Model(nn.Module):
         output_hidden_states: Optional[bool] = True,
         return_dict: Optional[bool] = None,
         cache_position: Optional[Cache] = None,
-        # block_mask: Optional[torch.Tensor] = None
         ):
-        
+
         if inputs_repres is None:
             inputs_embeds = self.embed_think(input_ids)
 
@@ -1164,6 +1166,7 @@ class T3Model(nn.Module):
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 attention_bias=attention_bias,
+                block_mask=block_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache or False,

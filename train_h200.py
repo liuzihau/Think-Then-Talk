@@ -21,6 +21,7 @@ from accelerate.utils import set_seed
 from tqdm import tqdm
 
 from model.modeling_t3 import T3Model
+from model.attention.flex_block_mask import build_t3_block_mask
 from train.data_process import build_dataset_rank, DataCollatorWithPadding, DataCollatorWithPaddingV2
 from train.data_process_balanced import build_4block_balanced_train_and_test_datasets
 from train.visualize import visualize_t3_batch_trace
@@ -537,6 +538,44 @@ def grad_norms_of_lora(model, k=10):
     none_cnt = sum(g is None for _, g in items)
     print("lora grads None:", none_cnt, "/", len(items))
 
+# -----------------------------
+# FlexAttention BlockMask cache
+# -----------------------------
+# Building a BlockMask is fast (~ms), but with `train_micro_batch_size_per_gpu=1`
+# many batches share the exact same per-sample region offsets, so caching by
+# shape signature gives a near-100% hit rate.
+
+_BLOCK_MASK_CACHE: dict = {}
+_BLOCK_MASK_CACHE_LIMIT = 256
+
+
+def get_block_mask_for_batch(data: dict, device):
+    """Build (or fetch from cache) the FlexAttention BlockMask for this batch."""
+    key = (
+        int(data["max_length"]),
+        int(data["block_size"]),
+        tuple(int(x) for x in data["inp_len"].tolist()),
+        tuple(int(x) for x in data["prefix_len"].tolist()),
+        tuple(int(x) for x in data["window_len"].tolist()),
+        tuple(int(x) for x in data["mask_len"].tolist()),
+    )
+    bm = _BLOCK_MASK_CACHE.get(key)
+    if bm is None:
+        bm = build_t3_block_mask(
+            inp_len=data["inp_len"],
+            prefix_len=data["prefix_len"],
+            window_len=data["window_len"],
+            mask_len=data["mask_len"],
+            block_size=int(data["block_size"]),
+            seq_len=int(data["max_length"]),
+            device=device,
+        )
+        if len(_BLOCK_MASK_CACHE) >= _BLOCK_MASK_CACHE_LIMIT:
+            _BLOCK_MASK_CACHE.clear()
+        _BLOCK_MASK_CACHE[key] = bm
+    return bm
+
+
 def split_params(model):
     talk_params = []
     lora_params = []
@@ -857,7 +896,7 @@ def main():
             input_ids_think = data["input_ids"]
             pos_ids_think   = data["position_ids"]
             attn_think      = data["attention_mask"]
-            bias_think      = data["attention_bias"]
+            block_mask_think = get_block_mask_for_batch(data, device)
             # -----------------
             # Think forward
             # -----------------
@@ -867,7 +906,7 @@ def main():
                     input_ids=input_ids_think,
                     position_ids=pos_ids_think,
                     attention_mask=attn_think,
-                    attention_bias=bias_think,
+                    block_mask=block_mask_think,
                     use_cache=False,
                     output_hidden_states=True
                 )
@@ -894,7 +933,9 @@ def main():
             rps = think_rps[mask_bool_talk].view(B, -1, H)           # [B, L, H]
             rps = rps.view(-1, model_raw.length, rps.shape[-1])      # [B*G, L, H]
             talk_attention_mask = torch.ones_like(input_ids, dtype=torch.long).view(-1, model_raw.length)
-            talk_bias = torch.zeros((1, 1, model_raw.length, model_raw.length), device=device, dtype=torch.float32)
+            # Talk model is unmasked (talk_attention_mask is all-ones; talk-side
+            # LLaDABlock.attention discards attention_bias). Pass nothing so the
+            # FlashAttention no-mask fast path is taken.
             loss_mask = torch.ones_like(target_talk, dtype=torch.float32).view(-1, model_raw.length)
 
             if do_vis:
@@ -914,7 +955,6 @@ def main():
                         inputs_embeds=input_embeds,
                         inputs_repres=rps,
                         attention_mask=talk_attention_mask,
-                        attention_bias=talk_bias,
                         use_cache=False,
                         output_hidden_states=True
                     )

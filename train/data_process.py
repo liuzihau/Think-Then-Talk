@@ -1027,12 +1027,17 @@ class DataCollatorWithPaddingV2:
         max_length = max(seq_lens)
 
         # ---- allocate batch tensors (more efficient than per-item pad+cat)
+        # Per-sample region lengths drive the FlexAttention BlockMask (built model-side).
+        # We no longer materialize the dense [B, 1, S, S] additive bias.
         dtype_ids = input_ids_list[0].dtype  # usually torch.long
         batch_input_ids = torch.full((B, max_length), self.pad_token_id, dtype=dtype_ids, device=device)
         batch_position_ids = torch.zeros((B, max_length), dtype=dtype_ids, device=device)
         batch_attention_mask = torch.zeros((B, max_length), dtype=torch.bool, device=device)
-        batch_attention_bias = torch.empty((B, 1, max_length, max_length), dtype=torch.float32, device=device)
         batch_loss_mask = torch.zeros((B, max_length), dtype=torch.long, device=device)  # usually bool/long
+        batch_inp_len = torch.zeros((B,), dtype=torch.int32, device=device)
+        batch_prefix_len = torch.zeros((B,), dtype=torch.int32, device=device)
+        batch_window_len = torch.zeros((B,), dtype=torch.int32, device=device)
+        batch_mask_len = torch.zeros((B,), dtype=torch.int32, device=device)
 
         # target window: [B, length]
         batch_target = torch.empty((B, self.total_length), dtype=target_list[0].dtype, device=device)
@@ -1046,26 +1051,16 @@ class DataCollatorWithPaddingV2:
             tgt = target_list[i]
 
             s = int(starts[i].item())
-            # clamp in case tgt shorter than length
-            # s = (min(s, max(tgt.size(0) - self.total_length, 0)) // self.block_size) * self.block_size
 
             prefix = tgt[:s]  # [s]
             window = tgt[s:s + self.total_length]  # [length] (or shorter if tgt too short)
-                        
-            # if tgt is shorter than length, pad window (rare if your data is valid)
-            # window_size = window.size(0)
-            # if window_size < self.total_length:
-            #     window_size = (window.size(0) // self.block_size) * self.block_size
-            #     if window_size == 0:
-            #         raise ValueError("a target window with size 0")
-            #     window = window[:window_size]
 
             real_len = window.size(0)
             if real_len < self.total_length:
                 eos_pad = torch.full((self.total_length - real_len,), self.eos_token_id, dtype=tgt.dtype, device=device)
                 window = torch.cat([window, eos_pad], dim=0)
             window_size = self.total_length
-            
+
             seq = torch.cat([inp, prefix.to(dtype_ids), window[:-self.block_size], mask_tokens[:window_size]], dim=0)  # [seq_len]
             L = seq.size(0)
 
@@ -1075,41 +1070,31 @@ class DataCollatorWithPaddingV2:
             masked_pos = torch.arange(prefix_end, prefix_end + window_size)
             pos = torch.cat([prefix_pos, window_pos, masked_pos], dim=0)  # [seq_len]
             assert pos.shape[0] == L, "mismatch length in position_ids and input_ids"
-            
+
             batch_input_ids[i, :L] = seq
             batch_position_ids[i, :L] = pos
-            
             batch_attention_mask[i, :L] = 1
-            allow = build_block_attention_mask(
-                max_length=max_length,
-                inp_len=inp.shape[0],
-                prefix_len=s,
-                window_len=window[:-self.block_size].shape[0],
-                mask_len=mask_tokens[:window_size].shape[0],
-                block_size=self.block_size,
-                device=inp.device,
-                allow_mask_within_block=True,
-                inp_attend_everything=False,
-            )
-            bias = torch.where(
-                allow,
-                torch.zeros_like(allow, dtype=torch.float32),
-                torch.full_like(allow, self.neg_inf, dtype=torch.float32),
-            )
-            batch_attention_bias[i, 0, :allow.shape[0], :allow.shape[1]] = bias
             batch_loss_mask[i, L - window_size:L] = 1  # only mask tokens contribute to loss
             batch_target[i] = window
 
-
-            # save_attn_mask_fig(batch_attention_mask, f"debug/attn_mask_{i}.png", title="Block attention check")
+            batch_inp_len[i]    = inp.shape[0]
+            batch_prefix_len[i] = s
+            batch_window_len[i] = window_size - self.block_size
+            batch_mask_len[i]   = window_size
 
         return {
             "input_ids": batch_input_ids,
             "position_ids": batch_position_ids,
             "target": batch_target,                 # [B, length]
             "attention_mask": batch_attention_mask, # [B, max_length]
-            "attention_bias": batch_attention_bias, # [B, :, max_length, max_length]
             "loss_mask": batch_loss_mask,           # [B, max_length]
+            # Per-sample T3 region offsets (FlexAttention BlockMask is built from these).
+            "inp_len":    batch_inp_len,    # [B]
+            "prefix_len": batch_prefix_len, # [B]
+            "window_len": batch_window_len, # [B]
+            "mask_len":   batch_mask_len,   # [B]
+            "block_size": self.block_size,
+            "max_length": max_length,
         }
 
 

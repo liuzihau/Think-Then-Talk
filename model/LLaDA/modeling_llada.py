@@ -26,10 +26,17 @@ import torch.backends.cuda
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import einsum
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.auto import AutoModel
 from transformers.cache_utils import Cache
+
+# FlexAttention requires torch.compile for the kernel-level speedup. Compile once
+# at import time; dynamic=False because seq_len is fixed within a forward but
+# may vary across batches (Dynamo will retrace per shape — bounded by the
+# BlockMask cache hit rate in train_h200.py).
+_compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
 
 from .configuration_llada import (
     LLaDAConfig,
@@ -642,37 +649,50 @@ class LLaDABlock(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
+        block_mask: Optional[BlockMask] = None,
         dropout_p: float = 0.0,
         is_causal: bool = False,
     ) -> torch.Tensor:
+        """Dispatch on which mask form is supplied.
+
+        Order:
+          1. block_mask is not None -> compiled flex_attention (training fast path
+             for the T3 4-region mask).
+          2. attn_mask is None and flash_attn available -> flash_attn_func (talk
+             side: no mask).
+          3. fallback -> F.scaled_dot_product_attention with dense additive bias.
         """
-        Computes scaled dot product attention on query, key and value tensors, using an optional
-        attention mask if passed, and applying dropout if a probability greater than 0.0 is specified.
-        """
+        if block_mask is not None:
+            # FlexAttention handles GQA natively; no need to repeat_interleave.
+            return _compiled_flex_attention(
+                q, k, v,
+                block_mask=block_mask,
+                enable_gqa=(q.size(1) != k.size(1)),
+            )
+
         if self.flash_attn_func is not None and attn_mask is None:
             r = self.flash_attn_func(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=dropout_p, causal=False
             )
             return r.transpose(1, 2)
-        else:
-            # torch's sdpa doesn't support GQA, so we're doing this
-            assert k.size(1) == v.size(1)
-            num_kv_heads = k.size(1)
-            num_q_heads = q.size(1)
-            if num_q_heads != num_kv_heads:
-                assert num_q_heads % num_kv_heads == 0
-                k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
-                v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
 
-            # Modify: MDM set causal to False.
-            return F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                is_causal=False,
-            )
+        # Legacy dense-bias fallback. SDPA doesn't support GQA so expand here.
+        assert k.size(1) == v.size(1)
+        num_kv_heads = k.size(1)
+        num_q_heads = q.size(1)
+        if num_q_heads != num_kv_heads:
+            assert num_q_heads % num_kv_heads == 0
+            k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+            v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=False,
+        )
 
     def attention(
         self,
@@ -680,6 +700,7 @@ class LLaDABlock(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         attention_bias: Optional[torch.Tensor] = None,
+        block_mask: Optional[BlockMask] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         position_ids: Optional[torch.LongTensor]= None
@@ -712,7 +733,14 @@ class LLaDABlock(nn.Module):
         present = (k, v) if use_cache else None
         query_len, key_len = q.shape[-2], k.shape[-2]  # could be different if layer_past not None
 
-        if attention_bias is not None:
+        # FlexAttention BlockMask is built for the full square attention; KV-cache
+        # incremental decode (query_len < key_len) needs a sub-mask which we don't
+        # build today. Training never hits this branch.
+        assert block_mask is None or query_len == key_len, (
+            "BlockMask was passed during incremental decoding; not supported."
+        )
+
+        if attention_bias is not None and block_mask is None:
             # Resize and cast attention bias.
             # The current dtype of the attention bias might not match the dtype that the SDP attn function will
             # run in if AMP is enabled, and this can be a problem if some tokens are masked out due to padding
@@ -728,7 +756,8 @@ class LLaDABlock(nn.Module):
             q,
             k,
             v,
-            attn_mask=attention_bias,
+            attn_mask=attention_bias if block_mask is None else None,
+            block_mask=block_mask,
             dropout_p=0.0 if not self.training else self.config.attention_dropout,
             is_causal=False,
         )
@@ -744,6 +773,7 @@ class LLaDABlock(nn.Module):
         self,
         x: torch.Tensor,
         attention_bias: Optional[torch.FloatTensor] = None,
+        block_mask: Optional[BlockMask] = None,
         position_ids: Optional[torch.LongTensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
@@ -802,6 +832,7 @@ class LLaDASequentialBlock(LLaDABlock):
         self,
         x: torch.Tensor,
         attention_bias: Optional[torch.Tensor] = None,
+        block_mask: Optional[BlockMask] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
@@ -822,10 +853,10 @@ class LLaDASequentialBlock(LLaDABlock):
         # Get attention scores.
         if self._activation_checkpoint_fn is not None:
             att, cache = self._activation_checkpoint_fn(  # type: ignore
-                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache
+                self.attention, q, k, v, attention_bias, block_mask, layer_past=layer_past, use_cache=use_cache
             )
         else:
-            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache)
+            att, cache = self.attention(q, k, v, attention_bias, block_mask, layer_past=layer_past, use_cache=use_cache)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -904,6 +935,7 @@ class LLaDALlamaBlock(LLaDABlock):
         self,
         x: torch.Tensor,
         attention_bias: Optional[torch.Tensor] = None,
+        block_mask: Optional[BlockMask] = None,
         position_ids: Optional[torch.LongTensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
@@ -923,10 +955,10 @@ class LLaDALlamaBlock(LLaDABlock):
         # Get attention scores.
         if self._activation_checkpoint_fn is not None:
             att, cache = self._activation_checkpoint_fn(  # type: ignore
-                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids
+                self.attention, q, k, v, attention_bias, block_mask, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids
             )
         else:
-            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids)
+            att, cache = self.attention(q, k, v, attention_bias, block_mask, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -995,6 +1027,7 @@ class LLaDABlockGroup(nn.ModuleList):
         self,
         x: torch.Tensor,
         attention_bias: Optional[torch.FloatTensor] = None,
+        block_mask: Optional[BlockMask] = None,
         layers_past: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         position_ids: Optional[torch.LongTensor] = None,
         use_cache: bool = False,
@@ -1020,11 +1053,11 @@ class LLaDABlockGroup(nn.ModuleList):
             ):
                 # shape: (batch_size, seq_len, d_model)
                 x, cache = self._activation_checkpoint_fn(  # type: ignore
-                    block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids
+                    block, x, attention_bias=attention_bias, block_mask=block_mask, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids
                 )
             else:
                 # shape: (batch_size, seq_len, d_model)
-                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids)
+                x, cache = block(x, attention_bias=attention_bias, block_mask=block_mask, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids)
             if attn_key_values is not None:
                 assert cache is not None
                 attn_key_values.append(cache)
@@ -1198,6 +1231,7 @@ class LLaDAModel(nn.Module):
         input_embeddings: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
+        block_mask: Optional[BlockMask] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
@@ -1269,50 +1303,56 @@ class LLaDAModel(nn.Module):
         # shape: (batch_size, seq_len, d_model)
         x = self.transformer.emb_drop(x)  # type: ignore
        
-        # Transform the attention mask into what the blocks expect.
-        if attention_mask is not None and 0.0 in attention_mask:
-            # shape: (batch_size, 1, 1, seq_len)
-            attention_mask = attention_mask.to(dtype=torch.float).view(batch_size, -1)[:, None, None, :]
-            attention_mask = (1.0 - attention_mask) * torch.finfo(attention_mask.dtype).min
-        else:
+        # When a FlexAttention BlockMask is supplied, it already encodes the full
+        # T3 mask (including padding); skip the dense-bias path entirely.
+        if block_mask is not None:
+            attention_bias = None
             attention_mask = None
+        else:
+            # Transform the attention mask into what the blocks expect.
+            if attention_mask is not None and 0.0 in attention_mask:
+                # shape: (batch_size, 1, 1, seq_len)
+                attention_mask = attention_mask.to(dtype=torch.float).view(batch_size, -1)[:, None, None, :]
+                attention_mask = (1.0 - attention_mask) * torch.finfo(attention_mask.dtype).min
+            else:
+                attention_mask = None
 
-        # Merge attention mask with attention bias.
-        if (
-            attention_bias is not None
-            or attention_mask is not None
-            or self.config.alibi
-            # NOTE (epwalsh): we need to initialize the attn bias in order for attn to work properly
-            # with key+value cache. Otherwise `F.scaled_dot_product_attention()` doesn't seem to compute
-            # scores correctly.
-            or past_key_values is not None
-        ):
-            if attention_bias is None and self.config.alibi:
-                attention_bias = get_causal_attention_bias(
-                    self.__cache, past_length + seq_len, x.device
-                ) + self.get_alibi_attention_bias(past_length + seq_len, x.device)
-            elif attention_bias is None:
-                attention_bias = self.get_bidirectional_attention_bias(past_length + seq_len, x.device)
-                # attention_bias = get_causal_attention_bias(self.__cache, past_length + seq_len, x.device)
-            elif attention_bias.dtype in (torch.int8, torch.bool):
-                attention_bias = attention_bias.to(dtype=torch.float)
-                attention_bias.masked_fill_(attention_bias == 0.0, torch.finfo(attention_bias.dtype).min)
+            # Merge attention mask with attention bias.
+            if (
+                attention_bias is not None
+                or attention_mask is not None
+                or self.config.alibi
+                # NOTE (epwalsh): we need to initialize the attn bias in order for attn to work properly
+                # with key+value cache. Otherwise `F.scaled_dot_product_attention()` doesn't seem to compute
+                # scores correctly.
+                or past_key_values is not None
+            ):
+                if attention_bias is None and self.config.alibi:
+                    attention_bias = get_causal_attention_bias(
+                        self.__cache, past_length + seq_len, x.device
+                    ) + self.get_alibi_attention_bias(past_length + seq_len, x.device)
+                elif attention_bias is None:
+                    attention_bias = self.get_bidirectional_attention_bias(past_length + seq_len, x.device)
+                    # attention_bias = get_causal_attention_bias(self.__cache, past_length + seq_len, x.device)
+                elif attention_bias.dtype in (torch.int8, torch.bool):
+                    attention_bias = attention_bias.to(dtype=torch.float)
+                    attention_bias.masked_fill_(attention_bias == 0.0, torch.finfo(attention_bias.dtype).min)
 
-            # Transform to the right shape and data type.
-            mask_len = seq_len
-            if attention_mask is not None:
-                mask_len = attention_mask.shape[-1]
-            elif past_key_values is not None:
-                mask_len = past_key_values[0][0].shape[-2] + seq_len
-            attention_bias = attention_bias[:, :, :mask_len, :mask_len].to(dtype=torch.float)
+                # Transform to the right shape and data type.
+                mask_len = seq_len
+                if attention_mask is not None:
+                    mask_len = attention_mask.shape[-1]
+                elif past_key_values is not None:
+                    mask_len = past_key_values[0][0].shape[-2] + seq_len
+                attention_bias = attention_bias[:, :, :mask_len, :mask_len].to(dtype=torch.float)
 
-            # Add in the masking bias.
-            if attention_mask is not None:
-                attention_bias = attention_bias + attention_mask
-                # Might get -infs after adding attention mask, since dtype.min + dtype.min = -inf.
-                # `F.scaled_dot_product_attention()` doesn't handle -inf like you'd expect, instead
-                # it can produce NaNs.
-                ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
+                # Add in the masking bias.
+                if attention_mask is not None:
+                    attention_bias = attention_bias + attention_mask
+                    # Might get -infs after adding attention mask, since dtype.min + dtype.min = -inf.
+                    # `F.scaled_dot_product_attention()` doesn't handle -inf like you'd expect, instead
+                    # it can produce NaNs.
+                    ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
 
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
 
@@ -1342,10 +1382,10 @@ class LLaDAModel(nn.Module):
                     )
                 ):
                     x, cache = self._activation_checkpoint_fn(
-                        block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids
+                        block, x, attention_bias=attention_bias, block_mask=block_mask, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids
                     )
                 else:
-                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids)
+                    x, cache = block(x, attention_bias=attention_bias, block_mask=block_mask, layer_past=layer_past, use_cache=use_cache, position_ids=position_ids)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
@@ -1418,6 +1458,7 @@ class LLaDAModelLM(PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
+        block_mask: Optional[BlockMask] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -1441,6 +1482,7 @@ class LLaDAModelLM(PreTrainedModel):
             input_embeddings=inputs_embeds,
             attention_mask=attention_mask,
             attention_bias=attention_bias,
+            block_mask=block_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
