@@ -67,6 +67,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The pre-axis-3 eval_t3.sh hardcodes an absolute python path (a teammate's
+# conda env) and uses the legacy think_device1/2/talk_device triple — both
+# were cleaned up in axis 3. Use the current eval_t3.sh as a shim on both
+# runs; the underlying eval_t3.py at each ref still accepts the new JSON
+# payload (old class has **kwargs and falls through `device`).
+EVAL_SHIM=$(mktemp --suffix=.sh)
+cp eval_t3.sh "${EVAL_SHIM}"
+chmod +x "${EVAL_SHIM}"
+
 # eval_t3.sh writes to a fixed output_path that includes the checkpoint dir
 # basename, but does NOT include the git ref. We park the dir after each run
 # so the second run doesn't clobber the first.
@@ -89,7 +98,7 @@ run_one() {
   CKPT_PATH="${T3_CKPT_PATH}" \
   GSM8K_GEN_LENGTH="${T3_GSM8K_GEN_LENGTH}" \
   BLOCK_SIZE="${T3_BLOCK_SIZE}" \
-    bash eval_t3.sh gsm8k --limit "${T3_LIMIT}" 2>&1 | tee "${log_path}"
+    bash "${EVAL_SHIM}" gsm8k --limit "${T3_LIMIT}" 2>&1 | tee "${log_path}"
   local rc=${PIPESTATUS[0]}
   set -e
   if [[ ${rc} -ne 0 ]]; then
