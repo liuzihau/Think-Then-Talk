@@ -51,6 +51,13 @@ echo "[axis3] outputs -> ${T3_OUT_DIR}"
 echo "[axis3] baseline ref: ${T3_BASELINE_REF}"
 echo "[axis3] checkpoint  : ${T3_CKPT_PATH}"
 
+# The capture script is copied to /tmp so it survives the git checkout, but
+# Python sets sys.path[0] to the script's directory (/tmp), not the CWD —
+# so `import model` fails without PYTHONPATH pointing at the repo root.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+
 CURRENT_REF=$(git rev-parse --abbrev-ref HEAD)
 if [[ "${CURRENT_REF}" == "HEAD" ]]; then
   CURRENT_REF=$(git rev-parse HEAD)
