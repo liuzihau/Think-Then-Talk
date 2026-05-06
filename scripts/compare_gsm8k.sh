@@ -16,7 +16,9 @@
 #
 # Optional env:
 #   T3_BASELINE_REF     Default HEAD~2 (the commit just before the axis 3 pair).
-#   T3_LIMIT            lm_eval --limit. Default 50.
+#   T3_LIMIT            lm_eval --limit. Default 50 (fast iteration). Set to
+#                       "" / "none" / "0" to evaluate the full GSM8K test set
+#                       (1319 problems → stderr ~0.014; expect ~1.5-3 h per run).
 #   T3_OUT_DIR          Where logs + parked output dirs land. Default ./validation_axis3.
 #   T3_GSM8K_GEN_LENGTH Forwarded to eval_t3.sh as GSM8K_GEN_LENGTH. Default 512.
 #   T3_BLOCK_SIZE       Forwarded as BLOCK_SIZE. Default 6.
@@ -33,10 +35,25 @@ set -euo pipefail
 # more commits land on top of the axis 3 pair. Override with T3_BASELINE_REF
 # if you want to compare against a different baseline.
 T3_BASELINE_REF=${T3_BASELINE_REF:-f25cc1e}
-T3_LIMIT=${T3_LIMIT:-50}
+# T3_LIMIT controls lm_eval's --limit. Default 50 (fast iteration, stderr
+# ~0.07). Set T3_LIMIT="" or "none" or "0" to evaluate on the full dataset
+# (1319 GSM8K problems → stderr ~0.014, pass gate tightens to ±1pp).
+T3_LIMIT=${T3_LIMIT-50}
 T3_OUT_DIR=${T3_OUT_DIR:-./validation_axis3}
 T3_GSM8K_GEN_LENGTH=${T3_GSM8K_GEN_LENGTH:-512}
 T3_BLOCK_SIZE=${T3_BLOCK_SIZE:-6}
+
+# Resolve the lm_eval --limit args once. Empty / "none" / "0" → no --limit.
+case "${T3_LIMIT,,}" in
+  ""|"none"|"0")
+    LIMIT_ARGS=()
+    LIMIT_LABEL="<full dataset>"
+    ;;
+  *)
+    LIMIT_ARGS=(--limit "${T3_LIMIT}")
+    LIMIT_LABEL="${T3_LIMIT}"
+    ;;
+esac
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
@@ -55,7 +72,7 @@ echo "[compare_gsm8k] outputs -> ${T3_OUT_DIR}"
 echo "[compare_gsm8k] baseline: ${T3_BASELINE_REF}"
 echo "[compare_gsm8k] current : ${CURRENT_REF}"
 echo "[compare_gsm8k] ckpt    : ${T3_CKPT_PATH}"
-echo "[compare_gsm8k] limit   : ${T3_LIMIT}"
+echo "[compare_gsm8k] limit   : ${LIMIT_LABEL}"
 
 cleanup() {
   local now
@@ -89,7 +106,7 @@ run_one() {
 
   echo
   echo "=========================================================================="
-  echo "[compare_gsm8k] running gsm8k --limit ${T3_LIMIT} on ${label} (${ref})"
+  echo "[compare_gsm8k] running gsm8k (limit=${LIMIT_LABEL}) on ${label} (${ref})"
   echo "=========================================================================="
   git checkout -q "${ref}"
 
@@ -98,7 +115,7 @@ run_one() {
   CKPT_PATH="${T3_CKPT_PATH}" \
   GSM8K_GEN_LENGTH="${T3_GSM8K_GEN_LENGTH}" \
   BLOCK_SIZE="${T3_BLOCK_SIZE}" \
-    bash "${EVAL_SHIM}" gsm8k --limit "${T3_LIMIT}" 2>&1 | tee "${log_path}"
+    bash "${EVAL_SHIM}" gsm8k "${LIMIT_ARGS[@]}" 2>&1 | tee "${log_path}"
   local rc=${PIPESTATUS[0]}
   set -e
   if [[ ${rc} -ne 0 ]]; then
@@ -150,5 +167,9 @@ echo "[compare_gsm8k] full eval output dirs (samples + results.json):"
 echo "  ${T3_OUT_DIR}/gsm8k_baseline_evals_results/"
 echo "  ${T3_OUT_DIR}/gsm8k_current_evals_results/"
 echo
-echo "[compare_gsm8k] gate: |Δ exact_match| ≤ 0.02 (2pp). If exceeded, stop and"
-echo "                investigate before treating axis 3 as validated."
+if [[ ${#LIMIT_ARGS[@]} -eq 0 ]]; then
+  echo "[compare_gsm8k] gate (full GSM8K, stderr ~0.014): |Δ exact_match| ≤ 0.01 (1pp)."
+else
+  echo "[compare_gsm8k] gate (limit=${T3_LIMIT}, stderr ~0.07): |Δ exact_match| ≤ 0.02 (2pp)."
+fi
+echo "                If exceeded, stop and investigate before treating axis 3 as validated."
