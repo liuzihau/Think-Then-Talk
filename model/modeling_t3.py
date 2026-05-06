@@ -1055,6 +1055,7 @@ class T3Model(nn.Module):
         cache_position: torch.LongTensor | None = None,  # Qwen3
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
+        prefer_no_mask: bool = False,                   # LLaDA inference fast path
         ):
 
         """
@@ -1083,6 +1084,7 @@ class T3Model(nn.Module):
                 use_cache=use_cache,
                 last_logits_only=last_logits_only,
                 output_hidden_states=output_hidden_states,
+                prefer_no_mask=prefer_no_mask,
                 )
 
         if self.architecture == "Qwen3":
@@ -1157,6 +1159,7 @@ class T3Model(nn.Module):
         output_hidden_states: Optional[bool] = True,
         return_dict: Optional[bool] = None,
         cache_position: Optional[Cache] = None,
+        prefer_no_mask: bool = False,
         ):
 
         if inputs_repres is None:
@@ -1172,6 +1175,7 @@ class T3Model(nn.Module):
                 use_cache=use_cache or False,
                 cache_position=cache_position,
                 output_hidden_states=output_hidden_states,
+                prefer_no_mask=prefer_no_mask,
             )
 
             inputs_repres = self.get_hidden_representation(hidden_states)

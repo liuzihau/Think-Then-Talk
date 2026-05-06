@@ -1246,6 +1246,7 @@ class LLaDAModel(nn.Module):
         use_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
+        prefer_no_mask: bool = False,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1315,6 +1316,14 @@ class LLaDAModel(nn.Module):
         # When a FlexAttention BlockMask is supplied, it already encodes the full
         # T3 mask (including padding); skip the dense-bias path entirely.
         if block_mask is not None:
+            attention_bias = None
+            attention_mask = None
+        elif prefer_no_mask and not self.config.alibi:
+            # Inference fast path (Fast-dLLM alignment): caller asserts there is
+            # no mask to apply (full bidirectional attention over prefix + cache
+            # + current tokens). Skip the bidirectional-bias buffer build so
+            # `_scaled_dot_product_attention` sees attn_mask=None and routes
+            # through `flash_attn_func` instead of SDPA-with-zero-bias.
             attention_bias = None
             attention_mask = None
         else:
@@ -1476,6 +1485,7 @@ class LLaDAModelLM(PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[Cache] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
+        prefer_no_mask: bool = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1496,6 +1506,7 @@ class LLaDAModelLM(PreTrainedModel):
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
+            prefer_no_mask=prefer_no_mask,
         )
 
         logits = outputs.logits

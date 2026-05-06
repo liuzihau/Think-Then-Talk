@@ -254,6 +254,7 @@ class _BaseT3EvalHarness(LM):
                 attention_mask=torch.ones_like(perturbed, dtype=torch.bool),
                 use_cache=False,
                 output_hidden_states=False,
+                prefer_no_mask=True,
             )
             h = hidden_states[-1] if isinstance(hidden_states, tuple) else hidden_states
 
