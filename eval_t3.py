@@ -1,350 +1,115 @@
-# eval_t3.py
-# Evaluation harness for Think-Then-Talk (T3) model
-# Based on Fast-dLLM's eval_llada.py structure
+"""lm_eval harness for Think-Then-Talk (T3).
 
-import os
+Drop-in lm_eval model that wraps `T3DecodeEngine` for `generate_until` and uses
+the think backbone directly for `loglikelihood` (MC log-likelihood estimation,
+LLaDA-style). Same decode core as `inference.py` — see `model/inference_engine.py`.
+
+Structure based on Fast-dLLM's `eval_llada.py` pattern.
+"""
 import json
+import os
 import time
-import random
-import re
-from typing import Any, Dict, Optional
-import torch
+from typing import Any, Dict
 
-import numpy as np
+import torch
 import torch.nn.functional as F
-from pathlib import Path
 from datasets import Dataset
 from tqdm import tqdm
-
-from lm_eval.__main__ import cli_evaluate
-from lm_eval.api.instance import Instance
-from lm_eval.api.model import LM
-from lm_eval.api.registry import register_model
 from transformers import AutoTokenizer
 
+from lm_eval.api.instance import Instance  # noqa: F401  (kept for downstream callers)
+from lm_eval.api.model import LM
+from lm_eval.api.registry import register_model
+
+from eval.overrides import DenoiseOverrides
+from model.inference_engine import T3DecodeEngine
 from model.modeling_t3 import T3Model
 from model.modeling_t3_infer import T3InferenceModel
-from utils import (
-    denoise_k_step_hard,
-    denoise_k_step_soft_embed_v2,
-    get_denoise_decode_config,
-    get_denoise_reveal_config,
-    get_policy_label,
-    load_ckpt,
-)
-def set_seed(seed):
-    torch.manual_seed(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def _is_missing_override(value: Any) -> bool:
-    return value is None or value == ""
-
-
-def _as_optional_int(value: Any) -> Optional[int]:
-    if _is_missing_override(value):
-        return None
-    return int(value)
-
-
-def _as_optional_float(value: Any) -> Optional[float]:
-    if _is_missing_override(value):
-        return None
-    return float(value)
-
-
-def _as_optional_str(value: Any) -> Optional[str]:
-    if _is_missing_override(value):
-        return None
-    return str(value)
-
-
-def _as_optional_bool(value: Any) -> Optional[bool]:
-    if _is_missing_override(value):
-        return None
-    if isinstance(value, bool):
-        return value
-    value_str = str(value).strip().lower()
-    if value_str in {"1", "true", "yes", "y", "on"}:
-        return True
-    if value_str in {"0", "false", "no", "n", "off"}:
-        return False
-    raise ValueError(f"Cannot parse boolean override from value: {value!r}")
-
-
-def _require_explicit_overrides(use_sh_denoise_policy: bool, raw_overrides: Dict[str, Any]) -> None:
-    if not use_sh_denoise_policy:
-        return
-
-    missing = [name for name, value in raw_overrides.items() if _is_missing_override(value)]
-    if missing:
-        raise ValueError(
-            "USE_SH_DENOISE_POLICY=1 requires every reveal/decode override to be set explicitly. "
-            "Missing: " + ", ".join(sorted(missing))
-        )
-
-
-def _extract_policy_choices(policy: Any, valid_modes) -> Dict[str, float]:
-    choices = {mode: 0.0 for mode in valid_modes}
-    if isinstance(policy, str) and policy in choices:
-        choices[policy] = 1.0
-        return choices
-    if isinstance(policy, dict):
-        raw_choices = policy.get("choices", {})
-        if isinstance(raw_choices, dict):
-            for mode in valid_modes:
-                if mode in raw_choices:
-                    choices[mode] = float(raw_choices[mode])
-    return choices
-
-
-def _build_policy_override(
-    current_policy: Any,
-    *,
-    fixed_mode: Optional[str],
-    weight_overrides: Dict[str, Optional[float]],
-) -> Any:
-    if fixed_mode is not None:
-        return fixed_mode
-
-    provided_weights = {
-        mode: weight
-        for mode, weight in weight_overrides.items()
-        if weight is not None
-    }
-    if not provided_weights:
-        return current_policy
-
-    merged_choices = _extract_policy_choices(current_policy, weight_overrides.keys())
-    for mode, weight in provided_weights.items():
-        merged_choices[mode] = float(weight)
-
-    return {
-        "type": "mixture",
-        "choices": merged_choices,
-    }
-
-
-def _apply_denoise_overrides(
-    model_config: Dict[str, Any],
-    *,
-    use_sh_denoise_policy=None,
-    reveal_k=None,
-    reveal_policy_mode=None,
-    reveal_random_weight=None,
-    reveal_greedy_weight=None,
-    reveal_ar_force_weight=None,
-    decode_policy_mode=None,
-    decode_fix_k=None,
-    decode_max_k=None,
-    decode_min_k=None,
-    decode_confidence_threshold=None,
-    decode_fix_weight=None,
-    decode_greedy_weight=None,
-) -> Dict[str, Any]:
-    use_sh_denoise_policy = _as_optional_bool(use_sh_denoise_policy)
-    use_sh_denoise_policy = bool(use_sh_denoise_policy) if use_sh_denoise_policy is not None else False
-
-    raw_overrides = {
-        "reveal_k": reveal_k,
-        "reveal_policy_mode": reveal_policy_mode,
-        "reveal_random_weight": reveal_random_weight,
-        "reveal_greedy_weight": reveal_greedy_weight,
-        "reveal_ar_force_weight": reveal_ar_force_weight,
-        "decode_policy_mode": decode_policy_mode,
-        "decode_fix_k": decode_fix_k,
-        "decode_max_k": decode_max_k,
-        "decode_min_k": decode_min_k,
-        "decode_confidence_threshold": decode_confidence_threshold,
-        "decode_fix_weight": decode_fix_weight,
-        "decode_greedy_weight": decode_greedy_weight,
-    }
-    _require_explicit_overrides(use_sh_denoise_policy, raw_overrides)
-
-    if not use_sh_denoise_policy:
-        return model_config
-
-    denoise_cfg = dict(model_config.get("denoise", {}) or {})
-    reveal_cfg = get_denoise_reveal_config(denoise_cfg)
-    decode_cfg = get_denoise_decode_config(denoise_cfg, default_k=reveal_cfg["k"])
-
-    reveal_k = _as_optional_int(reveal_k)
-    decode_fix_k = _as_optional_int(decode_fix_k)
-    decode_max_k = _as_optional_int(decode_max_k)
-    decode_min_k = _as_optional_int(decode_min_k)
-    decode_confidence_threshold = _as_optional_float(decode_confidence_threshold)
-
-    reveal_policy_mode = _as_optional_str(reveal_policy_mode)
-    decode_policy_mode = _as_optional_str(decode_policy_mode)
-
-    reveal_random_weight = _as_optional_float(reveal_random_weight)
-    reveal_greedy_weight = _as_optional_float(reveal_greedy_weight)
-    reveal_ar_force_weight = _as_optional_float(reveal_ar_force_weight)
-
-    decode_fix_weight = _as_optional_float(decode_fix_weight)
-    decode_greedy_weight = _as_optional_float(decode_greedy_weight)
-    if reveal_k is not None:
-        reveal_cfg["k"] = reveal_k
-
-    reveal_cfg["policy"] = _build_policy_override(
-        reveal_cfg.get("policy"),
-        fixed_mode=reveal_policy_mode,
-        weight_overrides={
-            "random": reveal_random_weight,
-            "greedy": reveal_greedy_weight,
-            "ar_force": reveal_ar_force_weight,
-        },
-    )
-
-    if decode_fix_k is not None:
-        decode_cfg["fix_k"] = decode_fix_k
-    if decode_max_k is not None:
-        decode_cfg["max_k"] = decode_max_k
-    if decode_min_k is not None:
-        decode_cfg["min_k"] = decode_min_k
-    if decode_confidence_threshold is not None:
-        decode_cfg["confidence_threshold"] = decode_confidence_threshold
-
-    decode_cfg["policy"] = _build_policy_override(
-        decode_cfg.get("policy"),
-        fixed_mode=decode_policy_mode,
-        weight_overrides={
-            "fix": decode_fix_weight,
-            "greedy": decode_greedy_weight,
-        },
-    )
-
-    denoise_cfg["reveal"] = reveal_cfg
-    denoise_cfg["decode"] = decode_cfg
-    model_config["denoise"] = denoise_cfg
-    return model_config
+from utils import load_ckpt, set_seed
 
 
 class _BaseT3EvalHarness(LM):
+    """Common eval harness; subclasses fix `MODEL_CLS`."""
+
     MODEL_CLS = T3Model
 
     def __init__(
         self,
-        ckpt_path='',
-        mask_id=126336,
-        max_length=4096,
-        batch_size=1,
-        mc_num=128,
-        is_check_greedy=False,
-        steps=None,
-        gen_length=256,
-        block_size=8,
-        device="cuda",
-        think_device1=None,
-        think_device2=None,
-        talk_device=None,
+        ckpt_path: str = "",
+        mask_id: int = 126336,
+        max_length: int = 4096,
+        batch_size: int = 1,
+        mc_num: int = 128,
+        is_check_greedy: bool = False,
+        gen_length: int = 256,
+        block_size: int = 8,
+        device: str = "cuda",
         save_dir=None,
-        show_speed=False,
-        prompt_prefix="",
-        prompt_suffix="",
-        reveal_k=None,
-        reveal_policy_mode=None,
-        reveal_random_weight=None,
-        reveal_greedy_weight=None,
-        reveal_ar_force_weight=None,
-        use_sh_denoise_policy=None,
-        decode_policy_mode=None,
-        decode_fix_k=None,
-        decode_max_k=None,
-        decode_min_k=None,
-        decode_confidence_threshold=None,
-        decode_fix_weight=None,
-        decode_greedy_weight=None,
-        **kwargs,
+        show_speed: bool = False,
+        prompt_prefix: str = "",
+        prompt_suffix: str = "",
+        seed: int = 0,
+        **override_kwargs: Any,
     ):
         super().__init__()
 
-        self.mask_id = mask_id
+        set_seed(int(seed))
+
+        self.mask_id = int(mask_id)
         self.batch_size = int(batch_size)
-        self.mc_num = mc_num
-        self.max_length = max_length
-        self.is_check_greedy = is_check_greedy
+        self.mc_num = int(mc_num)
+        self.max_length = int(max_length)
+        self.is_check_greedy = bool(is_check_greedy)
         self.gen_length = int(gen_length)
         self.block_size = int(block_size)
-        self.show_speed = show_speed
+        self.show_speed = bool(show_speed)
         self.save_dir = save_dir
         self.prompt_prefix = prompt_prefix
         self.prompt_suffix = prompt_suffix
+        self.device = str(device)
 
-        # The eval_t3.sh CLI surface still ships separate think_device1 / think_device2
-        # / talk_device kwargs; under the single-device refactor we collapse them onto
-        # one device. talk_device wins if multiple are provided.
-        resolved_device = talk_device or think_device1 or think_device2 or device
-        self.device = str(resolved_device)
-
-        # Load model config from checkpoint
-        config_path = os.path.join(ckpt_path, "config.json")
-        with open(config_path) as f:
+        # Load checkpoint config and apply optional shell-supplied denoise overrides.
+        with open(os.path.join(ckpt_path, "config.json")) as f:
             self.model_config = json.load(f)
-        self.model_config = _apply_denoise_overrides(
-            self.model_config,
-            use_sh_denoise_policy=use_sh_denoise_policy,
-            reveal_k=reveal_k,
-            reveal_policy_mode=reveal_policy_mode,
-            reveal_random_weight=reveal_random_weight,
-            reveal_greedy_weight=reveal_greedy_weight,
-            reveal_ar_force_weight=reveal_ar_force_weight,
-            decode_policy_mode=decode_policy_mode,
-            decode_fix_k=decode_fix_k,
-            decode_max_k=decode_max_k,
-            decode_min_k=decode_min_k,
-            decode_confidence_threshold=decode_confidence_threshold,
-            decode_fix_weight=decode_fix_weight,
-            decode_greedy_weight=decode_greedy_weight,
+        self.model_config = DenoiseOverrides.from_kwargs(**override_kwargs).apply(
+            self.model_config
         )
 
-        # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_config["pretrained_model_name_or_path"],
             trust_remote_code=True,
         )
 
-        # Load T3 model
         self.model = self.MODEL_CLS(
             self.model_config,
             train=False,
             device=self.device,
         )
         self.model.eval()
-        load_ckpt(ckpt_path, self.model, None, None, map_location="cpu")
+        load_ckpt(ckpt_path, self.model, optimizer=None, scheduler=None, map_location="cpu")
 
-        # Use the training-time denoise schedule when available.
-        # model.length is the block size copied from training config.
-        self.num_blocks = self.gen_length // self.block_size
-        denoise_cfg = self.model_config.get("denoise", {})
-        self.steps_per_block = int(denoise_cfg.get("steps", self.model.length))
-        self.reveal_cfg = get_denoise_reveal_config(denoise_cfg)
-        self.decode_cfg = get_denoise_decode_config(denoise_cfg, default_k=self.reveal_cfg["k"])
-        self.reveal_mode = get_policy_label(self.reveal_cfg.get("policy"), "ar_force")
-        self.reveal_k = int(self.reveal_cfg["k"])
+        self.engine = T3DecodeEngine(
+            model=self.model,
+            model_config=self.model_config,
+            block_size=self.block_size,
+            gen_length=self.gen_length,
+            mask_token_id=self.mask_id,
+        )
 
         print(
-            f"[T3Eval] steps_per_block={self.steps_per_block}, num_blocks={self.num_blocks}, "
-            f"reveal_mode={self.reveal_mode}, reveal_k={self.reveal_k}"
+            f"[T3Eval] block_size={self.block_size} gen_length={self.gen_length} "
+            f"steps_per_block={self.engine.steps_per_block} "
+            f"reveal_k={self.engine.reveal_k}"
         )
         print(
-            "[T3Eval] denoise_reveal_cfg="
-            + json.dumps(self.reveal_cfg, ensure_ascii=False)
-            + " denoise_decode_cfg="
-            + json.dumps(self.decode_cfg, ensure_ascii=False)
+            "[T3Eval] reveal_cfg=" + json.dumps(self.engine.reveal_cfg, ensure_ascii=False)
+            + " decode_cfg=" + json.dumps(self.engine.decode_cfg, ensure_ascii=False)
         )
 
         self._rank = 0
         self._world_size = 1
 
-    def _build_question(self, question):
-        return f"{self.prompt_prefix}{question}{self.prompt_suffix}"
-
-    def _prepare_generation_for_eval(self, req, gen_text):
-        return gen_text
+    # ---- LM interface ---------------------------------------------------------
 
     @property
     def rank(self):
@@ -354,273 +119,21 @@ class _BaseT3EvalHarness(LM):
     def world_size(self):
         return self._world_size
 
-    @torch.no_grad()
-    def t3_generate(self, input_ids):
-        """
-        Block-wise generation using T3 model (single-sample path, aligned with inference.py).
-        input_ids: [1, seq_len] prompt token ids on `self.device`
-        Returns: ([1, seq_len + gen_length] full sequence, nfe count)
-        """
-        B = input_ids.shape[0]
-        if B != 1:
-            raise ValueError(f"t3_generate expects batch size 1, got {B}")
-        seq_len = input_ids.shape[1]
-        max_len = seq_len + self.gen_length
-
-        x = torch.full(
-            (B, max_len), self.mask_id, dtype=torch.long, device=self.device
-        )
-        x[:, :seq_len] = input_ids
-
-        # Position ids
-        position_ids = torch.arange(0, max_len, device=self.device).unsqueeze(0).expand(B, -1)
-
-        # Attention mask (all ones)
-        attention_mask = torch.ones(B, max_len, dtype=torch.bool, device=self.device)
-
-        # Build block attention bias (bool, [max_len, max_len])
-        attention_bias = torch.zeros(
-            (max_len, max_len), dtype=torch.bool, device=self.device
-        )
-        # Prompt attends to prompt
-        attention_bias[:seq_len, :seq_len] = True
-        # Each mask block attends to prompt + all preceding blocks + itself
-        for block_idx in range(self.num_blocks):
-            r0 = seq_len + block_idx * self.block_size
-            r1 = seq_len + (block_idx + 1) * self.block_size
-            attention_bias[r0:r1, :r1] = True
-
-        past_key_values = None
-
-        # First think input: prompt + first mask block
-        x0 = x[:, :seq_len + self.block_size]
-        p0 = position_ids[:, :seq_len + self.block_size]
-        attn_mask = attention_mask[:, :seq_len + self.block_size]
-        attn_bias = attention_bias[:seq_len + self.block_size, :seq_len + self.block_size]
-        attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
-
-        nfe = 0
-
-        for block_idx in range(self.num_blocks):
-            # Think forward
-            think_outputs = self.model(
-                input_ids=x0,
-                attention_mask=attn_mask,
-                attention_bias=attn_bias,
-                position_ids=p0,
-                use_cache=True,
-                past_key_values=past_key_values,
-                output_hidden_states=True,
-            )
-            nfe += 1
-
-            past_key_values = think_outputs.past_key_values
-            # Trim KV cache: remove the mask block tokens
-            new_past_key_values = []
-            for i in range(len(past_key_values)):
-                new_past_key_values.append(())
-                for j in range(len(past_key_values[i])):
-                    new_past_key_values[i] += (
-                        past_key_values[i][j][:, :, :-self.block_size],
-                    )
-            past_key_values = new_past_key_values
-
-            think_rps = think_outputs.hidden_states
-
-            # Extract talk inputs for current block
-            s = seq_len + self.block_size * block_idx
-            e = seq_len + self.block_size * (block_idx + 1)
-
-            if x0.shape[-1] > 2 * self.block_size:
-                talk_input_ids = x0[:, s:e]
-                talk_rps = think_rps[:, s:e, :]
-            else:
-                talk_input_ids = x0[:, -self.block_size:]
-                talk_rps = think_rps[:, -self.block_size:, :]
-
-            talk_attn_mask = torch.ones_like(talk_input_ids, dtype=torch.long)
-            talk_attn_bias = torch.zeros(
-                (1, 1, self.block_size, self.block_size),
-                device=self.device,
-                dtype=torch.float32,
-            )
-            loss_mask = torch.ones_like(talk_attn_mask, dtype=torch.float32)
-
-            talk_input_embeds = F.embedding(talk_input_ids, self.model.talk_embed_weight)
-
-            # Denoise loop
-            for idx in range(self.steps_per_block):
-                if not loss_mask.bool().any():
-                    break
-                talk_outputs = self.model(
-                    input_ids=None,
-                    inputs_embeds=talk_input_embeds,
-                    inputs_repres=talk_rps,
-                    attention_mask=talk_attn_mask,
-                    attention_bias=talk_attn_bias,
-                    use_cache=False,
-                    output_hidden_states=True,
-                )
-                nfe += 1
-                logits = talk_outputs.logits.float()
-                talk_rps = talk_outputs.hidden_states
-
-                if self.model_config["soft_inputs"]["enabled"]:
-                    talk_input_ids, talk_input_embeds, loss_mask = denoise_k_step_soft_embed_v2(
-                        input_ids=talk_input_ids,
-                        target=None,
-                        loss_mask=loss_mask,
-                        logits=logits,
-                        emb_weight=self.model.talk_embed_weight,
-                        k_reveal=self.reveal_k,
-                        soft_topk=self.model_config["soft_inputs"]["top_k"],
-                        soft_temp=self.model_config["soft_inputs"]["temperature"],
-                        mode=self.reveal_cfg.get("policy", "ar_force"),
-                        decode_cfg=self.decode_cfg,
-                        sample_tokens=False,
-                    )
-                else:
-                    # Hard iterative reveal fallback (same as inference.py)
-                    talk_input_ids, loss_mask, _, _ = denoise_k_step_hard(
-                        input_ids=talk_input_ids,
-                        target=None,
-                        loss_mask=loss_mask,
-                        logits=logits,
-                        reveal_cfg=self.reveal_cfg,
-                        decode_cfg=self.decode_cfg,
-                    )
-                    talk_input_embeds = F.embedding(talk_input_ids, self.model.talk_embed_weight)
-
-            # After denoise loop: update x and prepare next block
-            x[:, s:e] = talk_input_ids
-
-            # Prepare next block input
-            x0 = x[:, s:e + self.block_size]
-            p0 = position_ids[:, s:e + self.block_size]
-            attn_mask = attention_mask[:, :e + self.block_size]
-            attn_bias = attention_bias[:e + self.block_size, :e + self.block_size]
-            attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)
-
-        return x, nfe
-
-    def _encode_pair(self, context, continuation):
-        n_spaces = len(context) - len(context.rstrip())
-        if n_spaces > 0:
-            continuation = context[-n_spaces:] + continuation
-            context = context[:-n_spaces]
-
-        whole_enc = self.tokenizer(context + continuation)["input_ids"]
-        context_enc = self.tokenizer(context)["input_ids"]
-
-        context_enc_len = len(context_enc)
-        continuation_enc = whole_enc[context_enc_len:]
-
-        return context_enc, continuation_enc
-
-    def _forward_process(self, batch, prompt_index):
-        """Monte Carlo forward diffusion for log-likelihood estimation."""
-        b, l = batch.shape
-        target_len = (l - prompt_index.sum()).item()
-        k = torch.randint(1, target_len + 1, (), device=batch.device)
-
-        x = torch.round(
-            torch.linspace(
-                float(k), k + (b - 1) * (target_len / b), steps=b, device=batch.device
-            )
-        ).long()
-        x = ((x - 1) % target_len) + 1
-
-        indices = torch.arange(target_len, device=batch.device).repeat(b, 1)
-        is_mask = indices < x.unsqueeze(1)
-
-        for i in range(b):
-            is_mask[i] = is_mask[i][torch.randperm(target_len)]
-
-        is_mask = torch.cat(
-            (
-                torch.zeros(b, prompt_index.sum(), dtype=torch.bool, device=batch.device),
-                is_mask,
-            ),
-            dim=1,
-        )
-
-        noisy_batch = torch.where(is_mask, self.mask_id, batch)
-        return noisy_batch, (x / target_len).unsqueeze(1).repeat(1, l)
-
-    @torch.no_grad()
-    def get_loglikelihood(self, prefix, target):
-        """
-        Estimate log-likelihood using the THINK model directly (MDM style).
-        This uses the base LLaDA model's bidirectional attention for MC estimation.
-        """
-        seq = torch.cat([prefix, target])[None, :]
-        seq = seq.repeat((self.batch_size, 1)).to(self.device)
-        prompt_index = torch.arange(seq.shape[1], device=self.device) < len(prefix)
-
-        loss_acc = []
-        for _ in range(self.mc_num // self.batch_size):
-            perturbed_seq, p_mask = self._forward_process(seq, prompt_index)
-            mask_indices = perturbed_seq == self.mask_id
-
-            # Use think model directly for likelihood (full bidirectional)
-            inputs_embeds = self.model.embed_think(perturbed_seq)
-            hidden_states, _ = self.model.run_think_model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=torch.ones_like(perturbed_seq, dtype=torch.bool),
-                use_cache=False,
-                output_hidden_states=False,
-            )
-
-            # Get logits from the think model's lm_head
-            if self.model.architecture == "LLaDA":
-                logits = F.linear(
-                    hidden_states[-1] if isinstance(hidden_states, tuple) else hidden_states,
-                    self.model.talk_lm_head_weight,
-                    self.model.talk_lm_head_bias,
-                )
-            else:
-                logits = self.model.think_model_root.lm_head(
-                    hidden_states[-1] if isinstance(hidden_states, tuple) else hidden_states
-                )
-
-            loss = (
-                F.cross_entropy(logits[mask_indices], seq[mask_indices], reduction="none")
-                / p_mask[mask_indices]
-            )
-            loss = loss.sum() / self.batch_size
-            loss_acc.append(loss.item())
-
-        return -sum(loss_acc) / len(loss_acc)
-
-    @torch.no_grad()
-    def suffix_greedy_prediction(self, prefix, target):
-        if not self.is_check_greedy:
-            return False
-        return False
-
     def loglikelihood(self, requests):
-        def _tokenize(e):
-            prefix, target = self._encode_pair(e["prefix"], e["target"])
-            return {
-                "prefix_text": e["prefix"],
-                "target_text": e["target"],
-                "prefix": prefix,
-                "target": target,
-            }
+        """Estimate log-likelihood per request via Monte Carlo forward diffusion.
 
-        ds = [{"prefix": req.args[0], "target": req.args[1]} for req in requests]
-        ds = Dataset.from_list(ds)
-        ds = ds.map(_tokenize)
-        ds = ds.with_format("torch")
+        Uses the think backbone directly (full bidirectional attention) — does
+        not go through the block-by-block decode engine.
+        """
+        rows = [{"prefix": req.args[0], "target": req.args[1]} for req in requests]
+        ds = Dataset.from_list(rows).map(self._tokenize_pair).with_format("torch")
 
         out = []
         with torch.no_grad():
             for elem in tqdm(ds, desc="Computing likelihood..."):
-                prefix = elem["prefix"]
-                target = elem["target"]
-                ll = self.get_loglikelihood(prefix, target)
-                is_target_greedy_dec = self.suffix_greedy_prediction(prefix, target)
-                out.append((ll, 1.0 if is_target_greedy_dec else 0.0))
+                ll = self._get_loglikelihood(elem["prefix"], elem["target"])
+                greedy_match = self._is_target_greedy(elem["prefix"], elem["target"])
+                out.append((ll, 1.0 if greedy_match else 0.0))
         torch.cuda.empty_cache()
         return out
 
@@ -628,61 +141,138 @@ class _BaseT3EvalHarness(LM):
         raise NotImplementedError
 
     def generate_until(self, requests):
-        output = [None] * len(requests)
-        num_tokens = 0
+        """Run block-by-block generation per request via the shared engine."""
+        outputs = [None] * len(requests)
         total_nfe = 0
-        processed_count = 0
+        total_tokens = 0
+        start = time.time()
 
-        start_time = time.time()
         pbar = tqdm(total=len(requests), desc="Generating...")
-
-        for req_idx, req in enumerate(requests):
+        for idx, req in enumerate(requests):
             question = self._build_question(req.args[0])
-            stop_tokens = req.args[1]["until"]
-
-            m = [{"role": "user", "content": question}]
-            user_input = self.tokenizer.apply_chat_template(
-                m, add_generation_prompt=True, tokenize=False
+            messages = [{"role": "user", "content": question}]
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False,
             )
-            ids_1d = self.tokenizer(
-                user_input, return_tensors="pt", add_special_tokens=False
-            ).input_ids[0]
+            prompt_ids = self.tokenizer(
+                prompt_text, return_tensors="pt", add_special_tokens=False,
+            ).input_ids.to(self.device)
+            prompt_len = int(prompt_ids.shape[1])
 
-            prompt_len = int(ids_1d.shape[0])
-            input_batch = ids_1d.unsqueeze(0).to(self.device)
-
-            generated, nfe = self.t3_generate(input_batch)
+            generated, nfe = self.engine.generate(prompt_ids)
             total_nfe += nfe
-            processed_count += 1
 
-            gen_ids = generated[0, prompt_len:]
-            gen_text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+            gen_text = self.tokenizer.decode(
+                generated[0, prompt_len:], skip_special_tokens=True,
+            )
+            outputs[idx] = self._prepare_generation_for_eval(req, gen_text)
 
             if self.show_speed:
                 gen_ids_clean = self.tokenizer(gen_text)["input_ids"]
-                num_tokens += sum(1 for t in gen_ids_clean if t != 126081)
-
-            output[req_idx] = self._prepare_generation_for_eval(req, gen_text)
+                total_tokens += sum(1 for t in gen_ids_clean if t != 126081)
 
             print("=" * 20)
             print("answer: ", gen_text)
-            print("nfe: ", nfe)
-            print("avg nfe: ", total_nfe / processed_count)
+            print("nfe: ", nfe, "  avg nfe: ", total_nfe / (idx + 1))
             print("=" * 20, end="\n\n")
-
             pbar.update(1)
-
         pbar.close()
 
-        end_time = time.time()
         if self.show_speed:
-            elapsed = end_time - start_time
-            print(f"Total tokens generated: {num_tokens}")
-            print(f"Total time: {elapsed:.2f}s")
-            print(f"Tokens/sec: {num_tokens / elapsed:.2f}")
-            print(f"Total NFE: {total_nfe}")
+            elapsed = time.time() - start
+            print(
+                f"Total tokens: {total_tokens}   total time: {elapsed:.2f}s   "
+                f"tokens/sec: {total_tokens / elapsed:.2f}   total nfe: {total_nfe}"
+            )
 
-        return output
+        return outputs
+
+    # ---- Internals -----------------------------------------------------------
+
+    def _build_question(self, question: str) -> str:
+        return f"{self.prompt_prefix}{question}{self.prompt_suffix}"
+
+    def _prepare_generation_for_eval(self, req, gen_text: str) -> str:
+        """Hook for subclasses; default is identity."""
+        return gen_text
+
+    def _tokenize_pair(self, e: Dict[str, str]) -> Dict[str, Any]:
+        prefix, target = self._encode_pair(e["prefix"], e["target"])
+        return {
+            "prefix_text": e["prefix"],
+            "target_text": e["target"],
+            "prefix": prefix,
+            "target": target,
+        }
+
+    def _encode_pair(self, context: str, continuation: str):
+        # Standard lm_eval pattern: shift trailing whitespace from context onto
+        # continuation so tokenization sees consistent boundaries.
+        n_spaces = len(context) - len(context.rstrip())
+        if n_spaces > 0:
+            continuation = context[-n_spaces:] + continuation
+            context = context[:-n_spaces]
+        whole = self.tokenizer(context + continuation)["input_ids"]
+        ctx = self.tokenizer(context)["input_ids"]
+        return ctx, whole[len(ctx):]
+
+    def _forward_process(self, batch: torch.Tensor, prompt_index: torch.Tensor):
+        """Monte Carlo forward diffusion for log-likelihood estimation."""
+        b, l = batch.shape
+        target_len = (l - prompt_index.sum()).item()
+        k = torch.randint(1, target_len + 1, (), device=batch.device)
+        x = torch.round(
+            torch.linspace(float(k), k + (b - 1) * (target_len / b), steps=b, device=batch.device)
+        ).long()
+        x = ((x - 1) % target_len) + 1
+
+        indices = torch.arange(target_len, device=batch.device).repeat(b, 1)
+        is_mask = indices < x.unsqueeze(1)
+        for i in range(b):
+            is_mask[i] = is_mask[i][torch.randperm(target_len)]
+
+        is_mask = torch.cat(
+            (torch.zeros(b, prompt_index.sum(), dtype=torch.bool, device=batch.device), is_mask),
+            dim=1,
+        )
+        noisy = torch.where(is_mask, self.mask_id, batch)
+        return noisy, (x / target_len).unsqueeze(1).repeat(1, l)
+
+    @torch.no_grad()
+    def _get_loglikelihood(self, prefix: torch.Tensor, target: torch.Tensor) -> float:
+        seq = torch.cat([prefix, target])[None, :].repeat((self.batch_size, 1)).to(self.device)
+        prompt_index = torch.arange(seq.shape[1], device=self.device) < len(prefix)
+
+        loss_acc = []
+        for _ in range(self.mc_num // self.batch_size):
+            perturbed, p_mask = self._forward_process(seq, prompt_index)
+            mask_idx = perturbed == self.mask_id
+
+            inputs_embeds = self.model.embed_think(perturbed)
+            hidden_states, _ = self.model.run_think_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=torch.ones_like(perturbed, dtype=torch.bool),
+                use_cache=False,
+                output_hidden_states=False,
+            )
+            h = hidden_states[-1] if isinstance(hidden_states, tuple) else hidden_states
+
+            if self.model.architecture == "LLaDA":
+                logits = F.linear(h, self.model.talk_lm_head_weight, self.model.talk_lm_head_bias)
+            else:
+                logits = self.model.think_model_root.lm_head(h)
+
+            loss = (
+                F.cross_entropy(logits[mask_idx], seq[mask_idx], reduction="none")
+                / p_mask[mask_idx]
+            )
+            loss_acc.append((loss.sum() / self.batch_size).item())
+        return -sum(loss_acc) / len(loss_acc)
+
+    @torch.no_grad()
+    def _is_target_greedy(self, prefix, target) -> bool:
+        # Currently disabled in lm_eval calls; kept for API parity.
+        return False if not self.is_check_greedy else False
 
 
 @register_model("t3_model")
@@ -695,5 +285,12 @@ class T3InferenceEvalHarness(_BaseT3EvalHarness):
     MODEL_CLS = T3InferenceModel
 
 
-if __name__ == "__main__":
+def main() -> None:
+    # `cli_evaluate` is lazy-imported because pulling it at module top costs
+    # 1-2 s of import time we don't want unit tests / quick scripts to pay.
+    from lm_eval.__main__ import cli_evaluate
     cli_evaluate()
+
+
+if __name__ == "__main__":
+    main()

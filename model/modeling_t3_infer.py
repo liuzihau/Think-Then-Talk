@@ -1,3 +1,10 @@
+"""Inference-focused T3 runtime.
+
+Thin subclass of `T3Model` that disables activation checkpointing and resolves
+`device="auto"` against accelerate / `LOCAL_RANK`. Checkpoint-compatible with
+the training-side `T3Model` — no `nn.Module` attributes are added or renamed,
+so existing `state_dict()`s load with zero key drift.
+"""
 import os
 
 import torch
@@ -15,35 +22,27 @@ def _read_int_env(name: str) -> int | None:
         return None
 
 
-def resolve_inference_device(device: str) -> str:
-    """Resolve a single inference device from an explicit string or "auto".
+def resolve_inference_device(device: str | torch.device) -> str | torch.device:
+    """Resolve `"auto"` against the runtime environment.
 
-    "auto" picks `cuda:LOCAL_RANK` under torchrun/accelerate, `cuda:0` for a
-    single visible GPU, and `cpu` when no GPU is available.
+    - `"auto"` + no CUDA visible → `"cpu"`
+    - `"auto"` + multi-GPU launch (WORLD_SIZE > 1, LOCAL_RANK set) → `"cuda:{LOCAL_RANK}"`
+    - `"auto"` + single GPU → `"cuda:0"`
+    - any other value: returned unchanged.
     """
     if device != "auto":
         return device
-
     if not torch.cuda.is_available():
         return "cpu"
-
     local_rank = _read_int_env("LOCAL_RANK")
     world_size = _read_int_env("WORLD_SIZE") or 1
     if world_size > 1 and local_rank is not None:
         return f"cuda:{local_rank}"
-
     return "cuda:0"
 
 
 class T3InferenceModel(T3Model):
-    """
-    Inference-focused T3 runtime.
-
-    Goals:
-    - keep checkpoint compatibility with the training-time T3 model
-    - disable activation checkpointing during eval/inference
-    - resolve a device from accelerate/env when the caller leaves it on "auto"
-    """
+    """T3Model with activation checkpointing disabled. Identical state_dict layout."""
 
     def __init__(
         self,
@@ -54,14 +53,6 @@ class T3InferenceModel(T3Model):
     ):
         if isinstance(device, str):
             device = resolve_inference_device(device)
-        print(f"[T3InferenceModel] resolved device: {device}")
-
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            train=train,
-            device=device,
-        )
-
+        super().__init__(config=config, dtype=dtype, train=train, device=device)
         if self.architecture == "LLaDA":
             self.think_model_root.model.set_activation_checkpointing(None)

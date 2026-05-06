@@ -1,7 +1,24 @@
-import os, json, math
+import os, json, math, random
+import numpy as np
 import torch
 import torch.nn.functional as F
 from typing import Any, Dict, Optional, Tuple
+
+
+def set_seed(seed: int) -> None:
+    """Pin Python / numpy / torch RNGs and disable cuDNN nondeterminism.
+
+    Single source of truth for seed-setting across train/eval/inference. Call
+    once near program start; nothing else in the codebase needs to repeat it.
+    """
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):

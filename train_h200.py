@@ -263,16 +263,13 @@ def append_jsonl(path: str, payload: dict):
 
 
 def build_eval_model_args(ckpt_path: str, block_size: int, device: str, eval_cfg: dict):
-    # eval_t3.py still accepts the legacy think_device1/think_device2/talk_device
-    # kwargs for CLI surface compatibility; we route all three to the same device.
+    """Build the JSON `--model_args` payload consumed by eval_t3.py."""
     device_str = str(eval_cfg.get("device", device))
     model_args = {
         "ckpt_path": ckpt_path,
         "gen_length": int(eval_cfg.get("gen_length", 512)),
         "block_size": int(eval_cfg.get("block_size", block_size)),
-        "think_device1": device_str,
-        "think_device2": device_str,
-        "talk_device": device_str,
+        "device": device_str,
         "show_speed": bool(eval_cfg.get("show_speed", True)),
         "prompt_prefix": str(eval_cfg.get("prompt_prefix", "")),
         "prompt_suffix": str(eval_cfg.get("prompt_suffix", "")),
