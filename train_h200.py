@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from model.modeling_t3 import T3Model
 from model.attention.flex_block_mask import build_t3_block_mask
-from train.data_process import build_dataset_rank, DataCollatorWithPadding, DataCollatorWithPaddingV2
+from train.data_process import build_dataset_rank, DataCollatorWithPaddingV2
 from train.data_process_balanced import build_4block_balanced_train_and_test_datasets
 from train.visualize import visualize_t3_batch_trace
 from utils import (
@@ -867,6 +867,11 @@ def main():
             model.eval()
 
         loss_cfg = train_config.get("loss", {})
+        # Per-iter stats inside the denoise loop (argmax / log_softmax over a
+        # full vocab) cost ~5-15% of step time but are telemetry-only. Compute
+        # them every N opt steps; the live training loss path stays untouched.
+        # Default 1 = compute every step (bit-identical to the pre-gate behaviour).
+        step_metrics_every_n = max(1, int(loss_cfg.get("step_metrics_every_n_steps", 1)))
 
         epoch_acces = [[] for _ in range(model_raw.length)]
         epoch_plosses = [[] for _ in range(model_raw.length)]
@@ -891,6 +896,10 @@ def main():
         pbar = tqdm(loader, desc=("train" if train else "test"), disable=not accelerator.is_local_main_process)
         for batch_idx, data in enumerate(pbar):
             do_vis = (train and (global_step % VIS_EVERY_OPT_STEP == 0) and ((batch_idx) % grad_accum == 0))
+            # Whether to compute per-iter telemetry (argmax/log_softmax) this batch.
+            # Constant across the grad_accum window because global_step only ticks
+            # on the optimizer-step boundary.
+            compute_step_metrics = (global_step % step_metrics_every_n == 0)
 
             # accelerator.prepare(loader) puts batch tensors on `device` already.
             input_ids_think = data["input_ids"]
@@ -967,28 +976,32 @@ def main():
                         target=target_talk,
                         loss_mask=loss_mask,
                     )
+                    loss_sums.append(loss_sum_i)
+                    counts.append(count_i)
 
-                    correct, total = calculate_correct_counts(logits, target_talk, loss_mask)
-                    certain_cols, certain_valid = pick_single_position(
-                        loss_mask=loss_mask,
-                        logits=logits,
-                        mode="greedy",
-                    )
-                    certain_loss_i, certain_acc_i = selected_position_loss_acc(
-                        logits=logits,
-                        target=target_talk,
-                        cols=certain_cols,
-                        valid=certain_valid,
-                    )
+                    # Per-iter telemetry. Each block here runs a full-vocab
+                    # argmax / log_softmax over [BG, L, V] and these aren't on
+                    # the training path — gated behind step_metrics_every_n_steps.
+                    if compute_step_metrics:
+                        correct, total = calculate_correct_counts(logits, target_talk, loss_mask)
+                        certain_cols, certain_valid = pick_single_position(
+                            loss_mask=loss_mask,
+                            logits=logits,
+                            mode="greedy",
+                        )
+                        certain_loss_i, certain_acc_i = selected_position_loss_acc(
+                            logits=logits,
+                            target=target_talk,
+                            cols=certain_cols,
+                            valid=certain_valid,
+                        )
+                        acces.append(correct / max(1, total))
+                        certain_losses.append(certain_loss_i)
+                        certain_accs.append(certain_acc_i)
+
                     denoise_cfg = train_config["denoise"]
                     reveal_cfg = get_denoise_reveal_config(denoise_cfg)
                     decode_cfg = get_denoise_decode_config(denoise_cfg, default_k=reveal_cfg["k"])
-
-                    loss_sums.append(loss_sum_i)
-                    counts.append(count_i)
-                    acces.append(correct / max(1, total))
-                    certain_losses.append(certain_loss_i)
-                    certain_accs.append(certain_acc_i)
 
                     if do_vis and idx < VIS_MAX_STEPS:
                         steps_pred_BG_L.append(logits.argmax(dim=-1).detach())  # [B*G, L]
@@ -1031,14 +1044,15 @@ def main():
                         )
                         input_embeds = F.embedding(input_ids, model_raw.talk_embed_weight)
 
-                    revealed_mask = loss_mask_prev.bool() & (~loss_mask.bool())
-                    decode_loss_i, decode_acc_i = masked_position_loss_acc(
-                        logits=logits,
-                        target=target_talk,
-                        position_mask=revealed_mask,
-                    )
-                    decode_losses.append(decode_loss_i)
-                    decode_accs.append(decode_acc_i)
+                    if compute_step_metrics:
+                        revealed_mask = loss_mask_prev.bool() & (~loss_mask.bool())
+                        decode_loss_i, decode_acc_i = masked_position_loss_acc(
+                            logits=logits,
+                            target=target_talk,
+                            position_mask=revealed_mask,
+                        )
+                        decode_losses.append(decode_loss_i)
+                        decode_accs.append(decode_acc_i)
 
                     if train_config["detach_recurrence"]["enabled"] and ((idx + 1) % train_config["detach_recurrence"]["every_r_steps"] == 0):
                         rps, input_embeds = detach_state(rps, input_embeds)
@@ -1092,28 +1106,36 @@ def main():
                 batch_decode_accs[i].append(decode_accs[i])
 
             if (batch_idx + 1) % grad_accum == 0:
-                batch_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_acces]
+                # Always-on stats (cheap; based on data we collect every step).
                 batch_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_plosses]
-                batch_certain_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_certain_losses]
-                batch_certain_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_certain_accs]
-                batch_decode_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_decode_losses]
-                batch_decode_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_decode_accs]
                 batch_clip_rate = float(np.mean(batch_clip_flags)) if len(batch_clip_flags) else 0.0
                 batch_grad_pre_mean = float(np.mean(batch_grad_norm_pre)) if len(batch_grad_norm_pre) else 0.0
                 batch_grad_post_mean = float(np.mean(batch_grad_norm_post)) if len(batch_grad_norm_post) else 0.0
-                for i in range(len(batch_acc_mean)):
-                    epoch_acces[i].append(batch_acc_mean[i])
                 for i in range(len(batch_loss_mean)):
                     epoch_plosses[i].append(batch_loss_mean[i])
-                for i in range(len(batch_certain_loss_mean)):
-                    epoch_certain_losses[i].append(batch_certain_loss_mean[i])
-                    epoch_certain_accs[i].append(batch_certain_acc_mean[i])
-                    epoch_decode_losses[i].append(batch_decode_loss_mean[i])
-                    epoch_decode_accs[i].append(batch_decode_acc_mean[i])
                 if len(batch_clip_flags):
                     epoch_clip_flags.extend(batch_clip_flags)
                     epoch_grad_norm_pre.extend(batch_grad_norm_pre)
                     epoch_grad_norm_post.extend(batch_grad_norm_post)
+
+                # Gated stats: only computed when compute_step_metrics; the
+                # underlying batch_* lists are empty otherwise.
+                if compute_step_metrics:
+                    batch_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_acces]
+                    batch_certain_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_certain_losses]
+                    batch_certain_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_certain_accs]
+                    batch_decode_loss_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_decode_losses]
+                    batch_decode_acc_mean = [float(np.mean(v)) if len(v) else 0.0 for v in batch_decode_accs]
+                    for i in range(len(batch_acc_mean)):
+                        epoch_acces[i].append(batch_acc_mean[i])
+                    for i in range(len(batch_certain_loss_mean)):
+                        epoch_certain_losses[i].append(batch_certain_loss_mean[i])
+                        epoch_certain_accs[i].append(batch_certain_acc_mean[i])
+                        epoch_decode_losses[i].append(batch_decode_loss_mean[i])
+                        epoch_decode_accs[i].append(batch_decode_acc_mean[i])
+
+                # Reset all per-batch accumulators (the gated-off ones are
+                # already empty, so resetting is a no-op for them).
                 batch_acces = [[] for _ in range(model_raw.length)]
                 batch_plosses = [[] for _ in range(model_raw.length)]
                 batch_certain_losses = [[] for _ in range(model_raw.length)]
@@ -1123,8 +1145,8 @@ def main():
                 batch_clip_flags = []
                 batch_grad_norm_pre = []
                 batch_grad_norm_post = []
-                
-                # wandb step logs
+
+                # wandb step logs.
                 if use_wandb and train:
                     logdict = {
                         "train/lr": optimizer.param_groups[0]["lr"],
@@ -1134,46 +1156,49 @@ def main():
                     }
                     for i, v in enumerate(batch_loss_mean):
                         logdict[f"train/ploss_{i:02d}"] = float(v)
-                    for i, a in enumerate(batch_acc_mean):
-                        logdict[f"train/acc_{i:02d}"] = float(a)
-                    for i, v in enumerate(batch_certain_loss_mean):
-                        logdict[f"train/certain_loss_{i:02d}"] = float(v)
-                    for i, a in enumerate(batch_certain_acc_mean):
-                        logdict[f"train/certain_acc_{i:02d}"] = float(a)
-                    for i, v in enumerate(batch_decode_loss_mean):
-                        logdict[f"train/decode_loss_{i:02d}"] = float(v)
-                    for i, a in enumerate(batch_decode_acc_mean):
-                        logdict[f"train/decode_acc_{i:02d}"] = float(a)
+                    if compute_step_metrics:
+                        for i, a in enumerate(batch_acc_mean):
+                            logdict[f"train/acc_{i:02d}"] = float(a)
+                        for i, v in enumerate(batch_certain_loss_mean):
+                            logdict[f"train/certain_loss_{i:02d}"] = float(v)
+                        for i, a in enumerate(batch_certain_acc_mean):
+                            logdict[f"train/certain_acc_{i:02d}"] = float(a)
+                        for i, v in enumerate(batch_decode_loss_mean):
+                            logdict[f"train/decode_loss_{i:02d}"] = float(v)
+                        for i, a in enumerate(batch_decode_acc_mean):
+                            logdict[f"train/decode_acc_{i:02d}"] = float(a)
                     wandb.log(logdict)
                 if train:
-                    append_jsonl(
-                        STEP_METRIC_LOG,
-                        {
-                            "epoch": int(epoch_num),
-                            "global_step": int(global_step),
-                            "lr": float(optimizer.param_groups[0]["lr"]),
-                            "loss_by_iter": batch_loss_mean,
+                    record = {
+                        "epoch": int(epoch_num),
+                        "global_step": int(global_step),
+                        "lr": float(optimizer.param_groups[0]["lr"]),
+                        "loss_by_iter": batch_loss_mean,
+                        "loss_mean": float(np.mean(batch_loss_mean)) if batch_loss_mean else 0.0,
+                        "clip_rate": batch_clip_rate,
+                        "grad_norm_preclip": batch_grad_pre_mean,
+                        "grad_norm_postclip": batch_grad_post_mean,
+                        "decode_mode": get_policy_label(
+                            get_denoise_reveal_config(train_config["denoise"]).get("policy"),
+                            "greedy",
+                        ),
+                    }
+                    if compute_step_metrics:
+                        record.update({
                             "acc_by_iter": batch_acc_mean,
                             "certain_loss_by_iter": batch_certain_loss_mean,
                             "certain_acc_by_iter": batch_certain_acc_mean,
                             "decode_loss_by_iter": batch_decode_loss_mean,
                             "decode_acc_by_iter": batch_decode_acc_mean,
-                            "loss_mean": float(np.mean(batch_loss_mean)),
                             "acc_mean": float(np.mean(batch_acc_mean)),
                             "certain_loss_mean": float(np.mean(batch_certain_loss_mean)),
                             "certain_acc_mean": float(np.mean(batch_certain_acc_mean)),
                             "decode_loss_mean": float(np.mean(batch_decode_loss_mean)),
                             "decode_acc_mean": float(np.mean(batch_decode_acc_mean)),
-                            "clip_rate": batch_clip_rate,
-                            "grad_norm_preclip": batch_grad_pre_mean,
-                            "grad_norm_postclip": batch_grad_post_mean,
-                            "decode_mode": get_policy_label(
-                                get_denoise_reveal_config(train_config["denoise"]).get("policy"),
-                                "greedy",
-                            ),
-                        },
-                    )
-                
+                        })
+                    append_jsonl(STEP_METRIC_LOG, record)
+
+
 
             if do_vis:
                 visualize_t3_batch_trace(

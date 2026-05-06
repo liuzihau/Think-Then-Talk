@@ -5,7 +5,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 from datasets import Dataset, Features, Sequence, Value, load_dataset, load_from_disk, concatenate_datasets
 import numpy as np
-import matplotlib.pyplot as plt
 
 HENDRYCKS_MATH_CONFIGS = [
     "algebra",
@@ -720,10 +719,7 @@ def build_dataset_rank(
             else:
                 print(f"dataset rank: returning FULL dataset ({len(ds1)} examples)")
 
-        print(f"[DEBUG] datapath={datapath} get_test_subset={get_test_subset} len(ds1)={len(ds1)}")
-
-        # IMPORTANT FIX:
-        # handle empty split BEFORE any processed cache load
+        # Handle empty split before any processed cache load.
         if len(ds1) == 0:
             ds1_proc = _empty_processed_dataset()
             if final_ds is None:
@@ -749,7 +745,6 @@ def build_dataset_rank(
             f"teoff{test_offset_i if test_offset_i is not None else 'na'}:v5"
         )
         processed_path = processed_root / proc_key / ("test" if get_test_subset else "train")
-        print(processed_path)
 
         ds1_proc = None
         if _is_local_saved_dataset(str(processed_path)):
@@ -785,88 +780,6 @@ def build_dataset_rank(
     final_ds.set_format(type="torch")
     return final_ds
 
-class DataCollatorWithPadding:
-
-    def __call__(self, features: List[Dict[str, Any]], length: int = 4, mask_token_id: int = 126336, pad_token_id: int = 126081) -> Dict[str, Any]:
-        # ---- helpers: accept [T] or [1,T] and always use [T]
-        def _to_1d(x: torch.Tensor) -> torch.Tensor:
-            if x.dim() == 2 and x.size(0) == 1:
-                return x.squeeze(0)
-            return x
-
-        B = len(features)
-        device = features[0]["input_ids"].device
-
-        input_ids_list = [_to_1d(f["input_ids"]) for f in features]          # [Li]
-        attn_mask_list = [_to_1d(f["attention_mask"]) for f in features]     # [Li]
-        target_list    = [_to_1d(f["target"]) for f in features]             # [Ti]
-
-        # ---- sample start indices uniformly for each example
-        # valid starts: 0..Ti-length (inclusive) => count = Ti-length+1
-        max_starts = torch.tensor(
-            [max(t.size(0) - length + 1, 1) for t in target_list],
-            device=device
-        )  # [B], clamp to >=1 to avoid errors if Ti < length
-
-        # uniform integer in [0, max_starts[i)-1]
-        starts = (torch.rand(B, device=device) * max_starts).long()  # [B]
-
-        # # TODO turn off debug
-        # starts = torch.ones((B,)).long() * 5
-
-        # ---- compute final sequence lengths and max_length
-        seq_lens = []
-        for i in range(B):
-            prefix_len = int(starts[i].item())
-            seq_lens.append(input_ids_list[i].size(0) + prefix_len + length)
-        max_length = max(seq_lens)
-
-        # ---- allocate batch tensors (more efficient than per-item pad+cat)
-        dtype_ids = input_ids_list[0].dtype  # usually torch.long
-        batch_input_ids = torch.full((B, max_length), pad_token_id, dtype=dtype_ids, device=device)
-        batch_attention_mask = torch.zeros((B, max_length), dtype=attn_mask_list[0].dtype, device=device)
-        batch_loss_mask = torch.zeros((B, max_length), dtype=torch.long, device=device)  # usually bool/long
-
-        # target window: [B, length]
-        batch_target = torch.empty((B, length), dtype=target_list[0].dtype, device=device)
-
-        mask_tokens = torch.full((length,), mask_token_id, dtype=dtype_ids, device=device)
-
-        # ---- fill each row
-        for i in range(B):
-            inp = input_ids_list[i]
-            att = attn_mask_list[i]
-            tgt = target_list[i]
-
-            s = int(starts[i].item())
-            # clamp in case tgt shorter than length
-            s = min(s, max(tgt.size(0) - length, 0))
-
-            prefix = tgt[:s]  # [s]
-            window = tgt[s:s + length]  # [length] (or shorter if tgt too short)
-
-            # if tgt is shorter than length, pad window (rare if your data is valid)
-            if window.size(0) < length:
-                padded = torch.full((length,), pad_token_id, dtype=tgt.dtype, device=device)
-                padded[:window.size(0)] = window
-                window = padded
-
-            seq = torch.cat([inp, prefix.to(dtype_ids), mask_tokens], dim=0)  # [seq_len]
-            L = seq.size(0)
-
-            batch_input_ids[i, :L] = seq
-            batch_attention_mask[i, :L] = 1  # or: torch.cat([att, ones...]) if you need original attn pattern
-            batch_loss_mask[i, L - length:L] = 1  # only mask tokens contribute to loss
-            batch_target[i] = window
-
-        return {
-            "input_ids": batch_input_ids,
-            "target": batch_target,                 # [B, length]
-            "attention_mask": batch_attention_mask, # [B, max_length]
-            "loss_mask": batch_loss_mask,           # [B, max_length]
-        }
-
-
 def build_block_attention_mask(
     max_length: int,
     inp_len: int,
@@ -875,100 +788,214 @@ def build_block_attention_mask(
     mask_len: int,
     block_size: int,
     device=None,
-    allow_mask_within_block: bool = True,
-    inp_attend_everything: bool = True,
 ) -> torch.BoolTensor:
-    """
-    Returns attn_mask of shape [S, S] where True means 'can attend'.
-    Sequence layout:
-      [ inp | prefix | window | mask ]
-    with prefix/window blockwise-causal, mask blockwise growth as described.
+    """Dense allow-mask for the T3 4-region layout: [ inp | prefix | window | mask ].
+
+    Returns a `[max_length, max_length]` bool tensor where `True` means
+    "query position can attend to key position". Source of truth for the
+    pattern; consulted by `tests/test_attn_equivalence.py` and the docstring
+    in `model/attention/flex_block_mask.py`. Allow rules:
+
+        inp     -> inp                                      (bidirectional)
+        prefix  -> inp ∪ prefix[0..b]                       (blockwise causal)
+        window  -> inp ∪ prefix ∪ window[0..b]              (same shape as prefix)
+        mask    -> inp ∪ prefix ∪ window[0..b-1] ∪ mask[b]  (sees prior windows
+                                                             and own block; not
+                                                             its own label window[b])
     """
     device = device or "cpu"
-
-    # Total length
-    S = inp_len + prefix_len + window_len + mask_len
     m = torch.zeros((max_length, max_length), dtype=torch.bool, device=device)
 
-    # Offsets
     o_inp = 0
     o_pre = o_inp + inp_len
     o_win = o_pre + prefix_len
     o_msk = o_win + window_len
 
-    # Helper: allow rows [r0:r1) to attend to cols [c0:c1)
-    def allow(r0, r1, c0, c1, v=True):
+    def allow(r0, r1, c0, c1):
         if r1 > r0 and c1 > c0:
-            m[r0:r1, c0:c1] = v
+            m[r0:r1, c0:c1] = True
 
-    # -----------------------
-    # 1) inp region
-    # -----------------------
-    # Everyone can attend to inp (inp is always visible context)
-    r0 = o_inp
-    r1 = o_inp + inp_len
-    c0 = o_inp
-    c1 = o_inp + inp_len
-    allow(r0, r1, c0, c1)#, 0.2)
+    # 1) inp -> inp
+    allow(o_inp, o_inp + inp_len, o_inp, o_inp + inp_len)
 
-    # -----------------------
-    # 2) prefix region: blockwise-causal
-    # -----------------------
-    # Blocks are contiguous chunks of size block_size.
+    # 2) prefix block b -> inp ∪ prefix[0..b]
     assert prefix_len % block_size == 0
-    num_pre_blocks = (prefix_len) // block_size
-    for b in range(num_pre_blocks):
+    for b in range(prefix_len // block_size):
         r0 = o_pre + b * block_size
         r1 = o_pre + (b + 1) * block_size
-        c0 = o_inp
-        c1 = o_pre + (b + 1) * block_size
-        allow(r0, r1, c0, c1)#, 0.5)
+        allow(r0, r1, o_inp, o_pre + (b + 1) * block_size)
 
-    # -----------------------
-    # 3) window region: same blockwise-causal as prefix
-    # -----------------------
+    # 3) window block b -> inp ∪ prefix ∪ window[0..b]
     assert window_len % block_size == 0
-    num_win_blocks = window_len // block_size
-    for b in range(num_win_blocks):
+    for b in range(window_len // block_size):
         r0 = o_win + b * block_size
         r1 = o_win + (b + 1) * block_size
-        c0 = o_inp
-        c1 = o_win + (b + 1) * block_size
-        allow(r0, r1, c0, c1)#, 0.7)
+        allow(r0, r1, o_inp, o_win + (b + 1) * block_size)
 
-    # -----------------------
-    # 4) mask region: growth by window blocks
-    # -----------------------
+    # 4) mask block b -> inp ∪ prefix ∪ window[0..b-1] ∪ mask[b]
     assert mask_len % block_size == 0
-    num_mask_blocks = mask_len // block_size
-    for b in range(num_mask_blocks):
+    for b in range(mask_len // block_size):
         r0 = o_msk + b * block_size
         r1 = o_msk + (b + 1) * block_size
-        c0 = o_inp
-        c1 = o_win + b * block_size
-        allow(r0, r1, c0, c1)#, 1)
-
-        c0 = o_msk + b * block_size
-        c1 = o_msk + (b + 1) * block_size
-        allow(r0, r1, c0, c1)#, 1)
-
+        allow(r0, r1, o_inp, o_win + b * block_size)
+        allow(r0, r1, o_msk + b * block_size, o_msk + (b + 1) * block_size)
 
     return m
 
+
 class DataCollatorWithPaddingV2:
-    def __init__(self, block_size: int=32, block_num: int=8, mask_token_id: int=126336, pad_token_id: int=126081, eos_token_id: int=126348, start_end_ratio: float=0.2, max_start_mode: str="exceed_end"):
+    """Collates per-sample sequences into the T3 4-region batch layout.
+
+    Output schema (consumed by `train_h200.py` and the FlexAttention BlockMask
+    cache key in `get_block_mask_for_batch`):
+
+        input_ids       [B, max_length]   long
+        position_ids    [B, max_length]   long  (window/mask blocks share
+                                                 positions with the prefix)
+        attention_mask  [B, max_length]   bool  (1 = real token, 0 = pad)
+        loss_mask       [B, max_length]   long  (1 = mask region, 0 elsewhere)
+        target          [B, total_length] long  (the window we're denoising
+                                                 toward; this *is* the label)
+        inp_len/prefix_len/window_len/mask_len   [B] int32
+        block_size, max_length                    Python ints (cache-key inputs)
+    """
+
+    def __init__(
+        self,
+        block_size: int = 32,
+        block_num: int = 8,
+        mask_token_id: int = 126336,
+        pad_token_id: int = 126081,
+        eos_token_id: int = 126348,
+        start_end_ratio: float = 0.2,
+    ):
         self.block_size = block_size
         self.block_num = block_num
         self.total_length = self.block_size * self.block_num
         self.mask_token_id = mask_token_id
         self.pad_token_id = pad_token_id
         self.eos_token_id = eos_token_id if eos_token_id is not None else pad_token_id
-        self.neg_inf = torch.finfo(torch.float32).min
+        # `start_end_ratio` controls the three-way roll on the prefix start:
+        # half of `start_end_ratio` of samples start at 0 (beginning of target),
+        # half end-aligned (close to the tail), the rest uniform random.
         self.start_end_ratio = start_end_ratio
-        self.max_start_mode = max_start_mode
+
+    def _sample_block_aligned_starts(
+        self,
+        target_lens: List[int],
+        device: torch.device,
+    ) -> torch.LongTensor:
+        """Three-way roll on the prefix start, then block-align.
+
+        Returns a `[B]` long tensor where `starts[i]` is the prefix length
+        (in tokens) for sample `i`, guaranteed to be a multiple of
+        `block_size` and in `[0, target_lens[i])`.
+        """
+        B = len(target_lens)
+        total = self.total_length
+        bs = self.block_size
+
+        # Two upper bounds on the start index:
+        #   normal_max: leaves room for the full target window after the prefix.
+        #   end_max:   end-aligned, leaves only 3/4 of the window — used by the
+        #              "end" branch so the model occasionally sees mostly-decoded
+        #              targets near the tail.
+        normal_max = torch.tensor(
+            [max(t - total + 1, 1) for t in target_lens],
+            device=device, dtype=torch.long,
+        )
+        end_max = torch.tensor(
+            [max(t - (total * 3) // 4 + 1, 1) for t in target_lens],
+            device=device, dtype=torch.long,
+        )
+
+        roll = torch.rand(B, device=device)
+        p = self.start_end_ratio / 2.0
+        is_start = roll < p
+        is_end = roll > (1.0 - p)
+        is_random = ~(is_start | is_end)
+
+        starts = torch.zeros(B, device=device, dtype=torch.long)
+        starts[is_end] = end_max[is_end] - 1
+        if is_random.any():
+            u = torch.rand(int(is_random.sum()), device=device)
+            starts[is_random] = (u * normal_max[is_random].float()).long()
+
+        return (starts // bs) * bs
+
+    def _build_one_sample(
+        self,
+        inp: torch.Tensor,
+        target: torch.Tensor,
+        start: int,
+        *,
+        out_input_ids: torch.Tensor,       # [max_length] slice
+        out_position_ids: torch.Tensor,    # [max_length] slice
+        out_attention_mask: torch.Tensor,  # [max_length] slice
+        out_loss_mask: torch.Tensor,       # [max_length] slice
+        out_target: torch.Tensor,          # [total_length] slice
+        mask_tokens: torch.Tensor,         # [total_length], cached on device
+        device: torch.device,
+        dtype_ids: torch.dtype,
+    ) -> Tuple[int, int, int, int]:
+        """Fill row `i`'s pre-allocated slots for one sample.
+
+        Writes regions directly into the output slices — no intermediate
+        `torch.cat` of [inp | prefix | window | mask]. Returns
+        `(inp_len, prefix_len, window_len, mask_len)` for the caller to record.
+        """
+        total = self.total_length
+        bs = self.block_size
+
+        inp_len = inp.shape[0]
+        prefix_len = start
+        window = target[start:start + total]
+
+        # Pad short windows with EOS so every sample contributes a full block.
+        if window.size(0) < total:
+            eos_pad = torch.full(
+                (total - window.size(0),), self.eos_token_id,
+                dtype=target.dtype, device=device,
+            )
+            window = torch.cat([window, eos_pad], dim=0)
+
+        # Region offsets in the output sequence.
+        window_len = total - bs   # window region drops the last block
+        mask_len = total          # mask region carries all `block_num` blocks
+        o_inp = 0
+        o_pre = o_inp + inp_len
+        o_win = o_pre + prefix_len
+        o_msk = o_win + window_len
+        L = o_msk + mask_len
+
+        # input_ids: write each region in place.
+        out_input_ids[o_inp:o_pre] = inp
+        out_input_ids[o_pre:o_win] = target[:prefix_len].to(dtype_ids)
+        out_input_ids[o_win:o_msk] = window[:window_len]
+        out_input_ids[o_msk:o_msk + mask_len] = mask_tokens[:mask_len]
+
+        # position_ids: prefix uses standard 0..prefix_end; window block b and
+        # mask block b share positions starting at prefix_end (so the model
+        # treats window[b] and mask[b] as the same logical position).
+        prefix_end = inp_len + prefix_len
+        pos_dtype = out_position_ids.dtype
+        out_position_ids[o_inp:o_win] = torch.arange(
+            0, prefix_end, device=device, dtype=pos_dtype,
+        )
+        out_position_ids[o_win:o_msk] = torch.arange(
+            prefix_end, prefix_end + window_len, device=device, dtype=pos_dtype,
+        )
+        out_position_ids[o_msk:o_msk + mask_len] = torch.arange(
+            prefix_end, prefix_end + mask_len, device=device, dtype=pos_dtype,
+        )
+
+        out_attention_mask[:L] = 1
+        out_loss_mask[L - mask_len:L] = 1
+        out_target[:] = window
+
+        return inp_len, prefix_len, window_len, mask_len
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        # ---- helpers: accept [T] or [1,T] and always use [T]
         def _to_1d(x: torch.Tensor) -> torch.Tensor:
             if x.dim() == 2 and x.size(0) == 1:
                 return x.squeeze(0)
@@ -977,206 +1004,72 @@ class DataCollatorWithPaddingV2:
         B = len(features)
         device = features[0]["input_ids"].device
 
-        input_ids_list = [_to_1d(f["input_ids"]) for f in features]          # [Li]
-        attn_mask_list = [_to_1d(f["attention_mask"]) for f in features]     # [Li]
-        target_list    = [_to_1d(f["target"]) for f in features]             # [Ti]
+        input_ids_list = [_to_1d(f["input_ids"]) for f in features]
+        target_list    = [_to_1d(f["target"]) for f in features]
+        target_lens    = [t.size(0) for t in target_list]
 
-        # for b in range(B):
-        #     print(input_ids_list[b].shape)
-        #     print(attn_mask_list[b].shape)
-        #     print(target_list[b].shape)
-        # raise Exception("hahaha")
-        
-        # ---- sample start indices uniformly for each example
-        # valid starts: 0..Ti-length (inclusive) => count = Ti-length+1
-        normal_max_starts = torch.tensor(
-                [max(t.size(0) - self.block_size * self.block_num + 1, 1) for t in target_list],
-                device=device
-        )  # [B], clamp to >=1 to avoid errors if Ti < length
-        end_max_starts = torch.tensor(
-                [max(t.size(0) - (self.block_size * self.block_num * 3) // 4 + 1, 1)for t in target_list],
-                device=device
-        )
+        starts = self._sample_block_aligned_starts(target_lens, device)
+        starts_py = [int(s) for s in starts.tolist()]
 
-        # uniform integer in [0, max_starts[i)-1]
-        roll = torch.rand(B, device=device)
-        p = self.start_end_ratio / 2.0
-
-        starts = torch.zeros(B, device=device, dtype=torch.long)
-
-        mask_start = roll < p
-        mask_end   = roll > (1.0 - p)
-        mask_rand  = ~(mask_start | mask_end)
-
-        starts[mask_start] = 0
-        starts[mask_end]   = end_max_starts[mask_end] - 1
-
-        # independent uniform draw for random region
-        u = torch.rand(mask_rand.sum(), device=device)
-        starts[mask_rand] = (u * normal_max_starts[mask_rand].float()).long()
-
-        for b in range(B):
-            starts[b] =  (starts[b] // self.block_size) * self.block_size
-        
-        # ---- compute final sequence lengths and max_length
-        # prefix + generated target + [block_size * block_num] gt + [block_size * block_num] mask
-        seq_lens = []
-        for i in range(B):
-            prefix_len = int(starts[i].item())
-            seq_lens.append(input_ids_list[i].size(0) + prefix_len + 2 * self.total_length - self.block_size)
+        # Each sample contributes inp + prefix + (total - bs) + total tokens.
+        seq_lens = [
+            input_ids_list[i].size(0) + starts_py[i] + 2 * self.total_length - self.block_size
+            for i in range(B)
+        ]
         max_length = max(seq_lens)
 
-        # ---- allocate batch tensors (more efficient than per-item pad+cat)
-        # Per-sample region lengths drive the FlexAttention BlockMask (built model-side).
-        # We no longer materialize the dense [B, 1, S, S] additive bias.
-        dtype_ids = input_ids_list[0].dtype  # usually torch.long
-        batch_input_ids = torch.full((B, max_length), self.pad_token_id, dtype=dtype_ids, device=device)
-        batch_position_ids = torch.zeros((B, max_length), dtype=dtype_ids, device=device)
-        batch_attention_mask = torch.zeros((B, max_length), dtype=torch.bool, device=device)
-        batch_loss_mask = torch.zeros((B, max_length), dtype=torch.long, device=device)  # usually bool/long
-        batch_inp_len = torch.zeros((B,), dtype=torch.int32, device=device)
+        # Pre-allocate batch tensors. The unused tail of each row stays at the
+        # initial fill value (pad_token_id / 0) — `attention_mask` marks the
+        # real region for downstream consumers.
+        dtype_ids = input_ids_list[0].dtype
+        batch_input_ids       = torch.full((B, max_length), self.pad_token_id, dtype=dtype_ids,    device=device)
+        batch_position_ids    = torch.zeros((B, max_length),                    dtype=dtype_ids,    device=device)
+        batch_attention_mask  = torch.zeros((B, max_length),                    dtype=torch.bool,   device=device)
+        batch_loss_mask       = torch.zeros((B, max_length),                    dtype=torch.long,   device=device)
+        batch_target          = torch.empty((B, self.total_length),             dtype=target_list[0].dtype, device=device)
+
+        batch_inp_len    = torch.zeros((B,), dtype=torch.int32, device=device)
         batch_prefix_len = torch.zeros((B,), dtype=torch.int32, device=device)
         batch_window_len = torch.zeros((B,), dtype=torch.int32, device=device)
-        batch_mask_len = torch.zeros((B,), dtype=torch.int32, device=device)
+        batch_mask_len   = torch.zeros((B,), dtype=torch.int32, device=device)
 
-        # target window: [B, length]
-        batch_target = torch.empty((B, self.total_length), dtype=target_list[0].dtype, device=device)
+        mask_tokens = torch.full(
+            (self.total_length,), self.mask_token_id,
+            dtype=dtype_ids, device=device,
+        )
 
-        mask_tokens = torch.full((self.total_length,), self.mask_token_id, dtype=dtype_ids, device=device)
-
-        # ---- fill each row
         for i in range(B):
-            inp = input_ids_list[i]
-            att = attn_mask_list[i]
-            tgt = target_list[i]
-
-            s = int(starts[i].item())
-
-            prefix = tgt[:s]  # [s]
-            window = tgt[s:s + self.total_length]  # [length] (or shorter if tgt too short)
-
-            real_len = window.size(0)
-            if real_len < self.total_length:
-                eos_pad = torch.full((self.total_length - real_len,), self.eos_token_id, dtype=tgt.dtype, device=device)
-                window = torch.cat([window, eos_pad], dim=0)
-            window_size = self.total_length
-
-            seq = torch.cat([inp, prefix.to(dtype_ids), window[:-self.block_size], mask_tokens[:window_size]], dim=0)  # [seq_len]
-            L = seq.size(0)
-
-            prefix_end = inp.shape[0] + prefix.shape[0]
-            prefix_pos = torch.arange(0, prefix_end)
-            window_pos = torch.arange(prefix_end, prefix_end + window_size-self.block_size)
-            masked_pos = torch.arange(prefix_end, prefix_end + window_size)
-            pos = torch.cat([prefix_pos, window_pos, masked_pos], dim=0)  # [seq_len]
-            assert pos.shape[0] == L, "mismatch length in position_ids and input_ids"
-
-            batch_input_ids[i, :L] = seq
-            batch_position_ids[i, :L] = pos
-            batch_attention_mask[i, :L] = 1
-            batch_loss_mask[i, L - window_size:L] = 1  # only mask tokens contribute to loss
-            batch_target[i] = window
-
-            batch_inp_len[i]    = inp.shape[0]
-            batch_prefix_len[i] = s
-            batch_window_len[i] = window_size - self.block_size
-            batch_mask_len[i]   = window_size
+            inp_len, prefix_len, window_len, mask_len = self._build_one_sample(
+                inp=input_ids_list[i],
+                target=target_list[i],
+                start=starts_py[i],
+                out_input_ids=batch_input_ids[i],
+                out_position_ids=batch_position_ids[i],
+                out_attention_mask=batch_attention_mask[i],
+                out_loss_mask=batch_loss_mask[i],
+                out_target=batch_target[i],
+                mask_tokens=mask_tokens,
+                device=device,
+                dtype_ids=dtype_ids,
+            )
+            batch_inp_len[i]    = inp_len
+            batch_prefix_len[i] = prefix_len
+            batch_window_len[i] = window_len
+            batch_mask_len[i]   = mask_len
 
         return {
-            "input_ids": batch_input_ids,
-            "position_ids": batch_position_ids,
-            "target": batch_target,                 # [B, length]
-            "attention_mask": batch_attention_mask, # [B, max_length]
-            "loss_mask": batch_loss_mask,           # [B, max_length]
+            "input_ids":      batch_input_ids,
+            "position_ids":   batch_position_ids,
+            "target":         batch_target,
+            "attention_mask": batch_attention_mask,
+            "loss_mask":      batch_loss_mask,
             # Per-sample T3 region offsets (FlexAttention BlockMask is built from these).
-            "inp_len":    batch_inp_len,    # [B]
-            "prefix_len": batch_prefix_len, # [B]
-            "window_len": batch_window_len, # [B]
-            "mask_len":   batch_mask_len,   # [B]
-            "block_size": self.block_size,
-            "max_length": max_length,
+            "inp_len":        batch_inp_len,
+            "prefix_len":     batch_prefix_len,
+            "window_len":     batch_window_len,
+            "mask_len":       batch_mask_len,
+            "block_size":     self.block_size,
+            "max_length":     max_length,
         }
 
 
-def save_attn_mask_fig(
-    attn_mask: torch.Tensor,
-    save_path: str,
-    title: str = "Attention mask (1=allow, 0=block)",
-    max_side: int = 2048,
-    show: bool = False,
-    dpi: int = 200,
-):
-    """
-    Save attention mask visualization to file.
-
-    Supports:
-      - bool [S,S] where True = allow
-      - bool [B,S,S] (uses batch 0)
-      - additive float/int [S,S] where 0=allow and -inf/very negative=block
-      - additive float/int [B,S,S] (uses batch 0)
-
-    Args:
-        save_path: path to save image, e.g. "mask.png"
-        show: whether to also display the figure
-    """
-    save_path = Path(save_path)
-
-    # pick batch 0 if batched
-    if attn_mask.dim() == 3:
-        attn = attn_mask[0]
-    else:
-        attn = attn_mask
-
-    if attn.shape[-2] != attn.shape[-1]:
-        raise ValueError(f"Expected square mask [S,S], got {tuple(attn.shape)}")
-
-    S = attn.shape[-1]
-
-    # downsample if too large
-    if S > max_side:
-        step = int(np.ceil(S / max_side))
-        attn = attn[::step, ::step]
-        title = f"{title} (downsampled {step}x, original S={S})"
-
-    # Convert to 1=allow, 0=block
-    if attn.dtype == torch.bool:
-        img = attn.detach().cpu().numpy().astype(np.float32)
-    else:
-        img = attn.detach().cpu().numpy()
-
-    plt.figure(figsize=(7, 7))
-    plt.imshow(img, interpolation="nearest", aspect="equal")
-    plt.title(title)
-    plt.xlabel("Key index (attend-to)")
-    plt.ylabel("Query index (attend-from)")
-    plt.colorbar(label="1=allow, 0=block")
-    plt.tight_layout()
-
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-    if show:
-        plt.show()
-    plt.close()
-
-
-if __name__ == "__main__":
-    from transformers import AutoTokenizer
-    from torch.utils.data import DataLoader
-    tokenizer = AutoTokenizer.from_pretrained("GSAI-ML/LLaDA-8B-Instruct", trust_remote_code=True)
-    testdataset = build_dataset_rank(
-        tokenizer, "nvidia/Llama-Nemotron-Post-Training-Dataset,allenai/tulu-3-sft-mixture", 4096, 256, splits="chat,train",
-        get_test_subset=True, seed=42
-    )
-    test_loader = DataLoader(
-        testdataset,
-        batch_size=2,
-        num_workers=1,
-        pin_memory=True,
-        collate_fn=DataCollatorWithPaddingV2()
-    )
-    print(len(test_loader))
-    for data in test_loader:
-        for key in data:
-            print(key, data[key].dtype)
-        break
-    
