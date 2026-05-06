@@ -29,7 +29,10 @@
 set -euo pipefail
 
 : "${T3_CKPT_PATH:?T3_CKPT_PATH must be set to a checkpoint directory}"
-T3_BASELINE_REF=${T3_BASELINE_REF:-HEAD~2}
+# Pinned to the explicit pre-axis-3 commit so this default doesn't rot as
+# more commits land on top of the axis 3 pair. Override with T3_BASELINE_REF
+# if you want to compare against a different baseline.
+T3_BASELINE_REF=${T3_BASELINE_REF:-f25cc1e}
 T3_LIMIT=${T3_LIMIT:-50}
 T3_OUT_DIR=${T3_OUT_DIR:-./validation_axis3}
 T3_GSM8K_GEN_LENGTH=${T3_GSM8K_GEN_LENGTH:-512}

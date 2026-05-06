@@ -59,9 +59,16 @@ class T3DecodeEngine:
         mask_token_id: int = LLADA_MASK_TOKEN_ID,
         steps_per_block: int | None = None,
     ):
+        # The old t3_generate silently floored num_blocks; we match that to
+        # avoid a behaviour regression (e.g. eval_t3.sh defaults gen_length=512
+        # with block_size=6 → 2 mask tokens trail). Warn instead of raising.
         if gen_length % block_size != 0:
-            raise ValueError(
-                f"gen_length ({gen_length}) must be a multiple of block_size ({block_size})."
+            import warnings
+            warnings.warn(
+                f"gen_length ({gen_length}) is not a multiple of block_size "
+                f"({block_size}); the trailing {gen_length % block_size} "
+                "position(s) will remain as mask_token_id and not be decoded.",
+                stacklevel=2,
             )
         self.model = model
         self.model_config = model_config

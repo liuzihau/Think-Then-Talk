@@ -37,7 +37,9 @@
 set -euo pipefail
 
 : "${T3_CKPT_PATH:?T3_CKPT_PATH must be set to a checkpoint directory}"
-T3_BASELINE_REF=${T3_BASELINE_REF:-HEAD~2}
+# Pinned to the explicit pre-axis-3 commit so this default doesn't rot as
+# more commits land on top of the axis 3 pair.
+T3_BASELINE_REF=${T3_BASELINE_REF:-f25cc1e}
 T3_PROMPT=${T3_PROMPT:-"Solve: 17 + 35 = ?"}
 T3_GEN_LENGTH=${T3_GEN_LENGTH:-48}
 T3_BLOCK_SIZE=${T3_BLOCK_SIZE:-6}
