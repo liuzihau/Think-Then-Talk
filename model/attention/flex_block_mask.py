@@ -147,7 +147,7 @@ def build_t3_block_mask(
     return create_block_mask(
         mask_mod,
         B=B, H=None, Q_LEN=seq_len, KV_LEN=seq_len,
-        device=device, _compile=True,
+        device=device,
     )
 
 

@@ -22,6 +22,7 @@ from dataclasses import fields
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch._dynamo
 import torch.backends.cuda
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,11 +33,19 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.auto import AutoModel
 from transformers.cache_utils import Cache
 
-# FlexAttention requires torch.compile for the kernel-level speedup. Compile once
-# at import time; dynamic=False because seq_len is fixed within a forward but
-# may vary across batches (Dynamo will retrace per shape — bounded by the
-# BlockMask cache hit rate in train_h200.py).
-_compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
+# FlexAttention requires torch.compile for the kernel-level speedup. seq_len
+# varies per batch in T3 training (variable inp_len + variable sampled prefix
+# length), so we compile with dynamic=True — Dynamo emits one symbolic-shape
+# graph that handles all seq_lens, instead of recompiling per shape. Without
+# this, every distinct seq_len triggers a retrace, the cache (default 8) fills
+# within a handful of batches, and Dynamo falls back to eager flex_attention
+# (which materializes the full score matrix and is slower than dense SDPA).
+#
+# We also raise the recompile limit defensively: even with dynamic=True, the
+# BlockMask tile pattern can change, and we'd rather pay a few extra compiles
+# than silently fall back to eager.
+torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
+_compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
 
 from .configuration_llada import (
     LLaDAConfig,
