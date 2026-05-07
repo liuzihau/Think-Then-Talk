@@ -99,10 +99,11 @@ class T3DecodeEngine:
         self.soft_topk = int(soft_cfg.get("top_k", 0))
         self.soft_temp = float(soft_cfg.get("temperature", 1.0))
 
-        # Option A from axis3_inference_flow.md: do a prompt-only prefill
-        # before any mask block enters x0. Removes prompt-vs-mask₀ pollution
-        # under prefer_no_mask=True (the dominant K/V-pollution layer).
-        # Set False to reproduce the commit-B regressed config for ablation.
+        # Option A (see T3_h200_refactor/axis3_inference.md §3.4): do a
+        # prompt-only prefill before any mask block enters x0. Removes
+        # prompt-vs-mask₀ pollution under prefer_no_mask=True (the dominant
+        # K/V-pollution layer). Set False to reproduce the commit-B
+        # regressed config for ablation.
         self.clean_prompt_kv = bool(clean_prompt_kv)
 
     @torch.no_grad()
@@ -138,12 +139,16 @@ class T3DecodeEngine:
             # cache before any mask block is visible. The first per-block
             # forward then consumes mask₀ alone with this clean cache, so
             # prompt's K/V never sees mask₀.
+            #
+            # NOTE: output_hidden_states must stay True — T3Model.forward
+            # unconditionally calls get_hidden_representation(hidden_states)
+            # on the think branch and crashes on None. We discard the result.
             prompt_outputs = self.model(
                 input_ids=x[:, :seq_len],
                 position_ids=position_ids[:, :seq_len],
                 use_cache=True,
                 past_key_values=None,
-                output_hidden_states=False,
+                output_hidden_states=True,
                 prefer_no_mask=True,
             )
             past_key_values = prompt_outputs.past_key_values
