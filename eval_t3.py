@@ -23,8 +23,7 @@ from lm_eval.api.registry import register_model
 
 from eval.overrides import DenoiseOverrides
 from model.inference_engine import T3DecodeEngine
-from model.modeling_t3 import T3Model
-from model.modeling_t3_infer import T3InferenceModel
+from model.modeling_t3 import T3InferenceModel, T3Model
 from utils import load_ckpt, set_seed
 
 

@@ -25,7 +25,7 @@ import pytest
 import torch
 
 from model.inference_engine import T3DecodeEngine, LLADA_MASK_TOKEN_ID
-from model.modeling_t3_infer import T3InferenceModel
+from model.modeling_t3 import T3InferenceModel
 from utils import load_ckpt, set_seed
 
 

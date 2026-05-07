@@ -25,8 +25,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from model.modeling_t3 import T3Model
-from model.modeling_t3_infer import T3InferenceModel
+from model.modeling_t3 import T3InferenceModel, T3Model
 
 
 _ALLOW_MISSING_TALK = {"rps_eta_param"}

@@ -1,5 +1,6 @@
 from abc import abstractmethod
 import math
+import os
 from typing import Callable, List, Optional, Sequence, Tuple, Dict
 import logging
 # from dataclasses import fields
@@ -1207,7 +1208,66 @@ class T3Model(nn.Module):
             past_key_values=past_key_values,
             hidden_states=inputs_repres,
         )
-        
+
+
+# ---- Inference-side variant ------------------------------------------------
+#
+# Used to live in `model/modeling_t3_infer.py`; merged here in the axis-3
+# cleanup (the helper file was a 12-line subclass plus a 30-line device
+# resolver — too small to justify its own module). Checkpoint-compatible
+# with `T3Model` by construction (no `nn.Module` attributes added or
+# renamed).
+
+def _read_int_env(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def resolve_inference_device(device):
+    """Resolve `"auto"` to a real device based on the runtime environment.
+
+    - `"auto"` + no CUDA visible → `"cpu"`
+    - `"auto"` + multi-GPU launch (WORLD_SIZE > 1, LOCAL_RANK set) → `"cuda:{LOCAL_RANK}"`
+    - `"auto"` + single GPU → `"cuda:0"`
+    - any other value → returned unchanged.
+    """
+    if device != "auto":
+        return device
+    if not torch.cuda.is_available():
+        return "cpu"
+    local_rank = _read_int_env("LOCAL_RANK")
+    world_size = _read_int_env("WORLD_SIZE") or 1
+    if world_size > 1 and local_rank is not None:
+        return f"cuda:{local_rank}"
+    return "cuda:0"
+
+
+class T3InferenceModel(T3Model):
+    """T3Model with activation checkpointing disabled and `device="auto"`
+    resolution. Identical state_dict layout to T3Model — checkpoints load
+    on either class with zero key drift."""
+
+    def __init__(
+        self,
+        config: dict,
+        dtype: torch.dtype = torch.bfloat16,
+        train: bool = False,
+        device=None,
+    ):
+        if device is None:
+            device = "auto"
+        if isinstance(device, str):
+            device = resolve_inference_device(device)
+        super().__init__(config=config, dtype=dtype, train=train, device=device)
+        if self.architecture == "LLaDA":
+            self.think_model_root.model.set_activation_checkpointing(None)
+
+
 def list_module_name_hints(model: nn.Module, contains=("q", "k", "v", "o", "proj")):
     hits = set()
     for name, module in model.named_modules():
