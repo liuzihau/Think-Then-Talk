@@ -6,9 +6,13 @@ this engine; only the surrounding I/O differs.
 
 ## Decode flow (per block)
 
-    1. Think forward over (cached prefix + current mask block).
-       FlashAttention's no-mask fast path runs because the call uses
-       `prefer_no_mask=True` (fully bidirectional, mirrors Fast-dLLM v1).
+    1. Think forward over (cached prefix + current mask block) under a
+       block-causal `attention_bias`: prompt is bidirectional within itself,
+       each generated block sees prompt + already-decoded blocks + itself,
+       and crucially each row cannot see *future* mask tokens. This matches
+       the pre-axis-3 baseline (`f25cc1e`) and avoids the K/V pollution
+       chain that the Fast-dLLM-style no-mask path suffers from on this
+       checkpoint.
     2. Trim the trailing `block_size` entries from the KV cache so the next
        iteration recomputes K/V for those positions against the freshly
        decoded prefix.
@@ -58,7 +62,6 @@ class T3DecodeEngine:
         gen_length: int,
         mask_token_id: int = LLADA_MASK_TOKEN_ID,
         steps_per_block: int | None = None,
-        clean_prompt_kv: bool = True,
     ):
         # The old t3_generate silently floored num_blocks; we match that to
         # avoid a behaviour regression (e.g. eval_t3.sh defaults gen_length=512
@@ -99,13 +102,6 @@ class T3DecodeEngine:
         self.soft_topk = int(soft_cfg.get("top_k", 0))
         self.soft_temp = float(soft_cfg.get("temperature", 1.0))
 
-        # Option A (see T3_h200_refactor/axis3_inference.md §3.4): do a
-        # prompt-only prefill before any mask block enters x0. Removes
-        # prompt-vs-mask₀ pollution under prefer_no_mask=True (the dominant
-        # K/V-pollution layer). Set False to reproduce the commit-B
-        # regressed config for ablation.
-        self.clean_prompt_kv = bool(clean_prompt_kv)
-
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """Generate `gen_length` tokens conditioned on `input_ids`.
@@ -132,42 +128,26 @@ class T3DecodeEngine:
         x = torch.full((1, max_len), self.mask_token_id, dtype=torch.long, device=device)
         x[:, :seq_len] = input_ids
         position_ids = torch.arange(0, max_len, device=device).unsqueeze(0)
+        attention_mask = torch.ones((1, max_len), dtype=torch.bool, device=device)
+        attention_bias = _build_blockwise_attention_bias(
+            seq_len=seq_len, max_len=max_len, block_size=self.block_size, device=device,
+        )
+
+        past_key_values = None
+        cur_len = seq_len + self.block_size
+        x0 = x[:, :cur_len]
+        p0 = position_ids[:, :cur_len]
 
         nfe = 0
-        if self.clean_prompt_kv:
-            # Pass 0a: prompt-only prefill. Writes clean prompt K/V into the
-            # cache before any mask block is visible. The first per-block
-            # forward then consumes mask₀ alone with this clean cache, so
-            # prompt's K/V never sees mask₀.
-            #
-            # NOTE: output_hidden_states must stay True — T3Model.forward
-            # unconditionally calls get_hidden_representation(hidden_states)
-            # on the think branch and crashes on None. We discard the result.
-            prompt_outputs = self.model(
-                input_ids=x[:, :seq_len],
-                position_ids=position_ids[:, :seq_len],
-                use_cache=True,
-                past_key_values=None,
-                output_hidden_states=True,
-                prefer_no_mask=True,
-            )
-            past_key_values = prompt_outputs.past_key_values
-            nfe += 1
-            x0 = x[:, seq_len : seq_len + self.block_size]
-            p0 = position_ids[:, seq_len : seq_len + self.block_size]
-        else:
-            past_key_values = None
-            x0 = x[:, : seq_len + self.block_size]
-            p0 = position_ids[:, : seq_len + self.block_size]
-
         for block_idx in range(self.num_blocks):
             think_outputs = self.model(
                 input_ids=x0,
+                attention_mask=attention_mask[:, :cur_len],
+                attention_bias=attention_bias[:, :, :cur_len, :cur_len],
                 position_ids=p0,
                 use_cache=True,
                 past_key_values=past_key_values,
                 output_hidden_states=True,
-                prefer_no_mask=True,  # Fast-dLLM-aligned; routes to FlashAttention.
             )
             nfe += 1
 
@@ -187,8 +167,9 @@ class T3DecodeEngine:
             x[:, block_start:block_end] = decoded_ids
 
             # Slide the window for the next block.
-            x0 = x[:, block_start : block_end + self.block_size]
-            p0 = position_ids[:, block_start : block_end + self.block_size]
+            cur_len = block_end + self.block_size
+            x0 = x[:, block_start:cur_len]
+            p0 = position_ids[:, block_start:cur_len]
 
         return x, nfe
 
@@ -244,6 +225,27 @@ class T3DecodeEngine:
                 talk_input_embeds = F.embedding(talk_input_ids, self.model.talk_embed_weight)
 
         return talk_input_ids, nfe
+
+
+def _build_blockwise_attention_bias(
+    *,
+    seq_len: int,
+    max_len: int,
+    block_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Block-causal allow mask: prompt is bidirectional within itself; each
+    generated block sees prompt + all earlier blocks + itself; future mask
+    blocks are blocked. Returns `[1, 1, max_len, max_len]` bool. Caller
+    slices to the relevant prefix per block forward.
+    """
+    bias = torch.zeros((max_len, max_len), dtype=torch.bool, device=device)
+    bias[:seq_len, :seq_len] = True
+    num_blocks = (max_len - seq_len) // block_size
+    for b in range(num_blocks):
+        end = seq_len + (b + 1) * block_size
+        bias[seq_len + b * block_size : end, :end] = True
+    return bias.unsqueeze(0).unsqueeze(0)
 
 
 def _trim_kv_cache_trailing(past_key_values, n: int):
