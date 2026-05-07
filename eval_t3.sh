@@ -12,7 +12,7 @@
 # Optional knobs (all have sensible defaults below):
 #   TASK                      First positional arg, or this var. One of:
 #                             gsm8k | math500 | hendrycks_math500 | minerva_math500 | humaneval
-#   CUDA_NO                   Index of the GPU to expose. Default: 3.
+#   CUDA_NO                   Index of the GPU to expose. Default: 0.
 #   DEVICE                    Override of `cuda:${CUDA_NO}`. Pass "auto" to let
 #                             T3InferenceModel resolve LOCAL_RANK/WORLD_SIZE.
 #   MODEL_NAME                lm_eval registry name. Default: t3_model_infer
@@ -59,7 +59,7 @@ fi
 
 # ---- Inference target --------------------------------------------------------
 CKPT_PATH=${CKPT_PATH:?CKPT_PATH must be set to a checkpoint directory}
-CUDA_NO=${CUDA_NO:-3}
+CUDA_NO=${CUDA_NO:-0}
 DEVICE=${DEVICE:-cuda:${CUDA_NO}}
 MODEL_NAME=${MODEL_NAME:-t3_model_infer}
 BLOCK_SIZE=${BLOCK_SIZE:-6}
