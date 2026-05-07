@@ -58,6 +58,7 @@ class T3DecodeEngine:
         gen_length: int,
         mask_token_id: int = LLADA_MASK_TOKEN_ID,
         steps_per_block: int | None = None,
+        clean_prompt_kv: bool = True,
     ):
         # The old t3_generate silently floored num_blocks; we match that to
         # avoid a behaviour regression (e.g. eval_t3.sh defaults gen_length=512
@@ -98,6 +99,12 @@ class T3DecodeEngine:
         self.soft_topk = int(soft_cfg.get("top_k", 0))
         self.soft_temp = float(soft_cfg.get("temperature", 1.0))
 
+        # Option A from axis3_inference_flow.md: do a prompt-only prefill
+        # before any mask block enters x0. Removes prompt-vs-mask₀ pollution
+        # under prefer_no_mask=True (the dominant K/V-pollution layer).
+        # Set False to reproduce the commit-B regressed config for ablation.
+        self.clean_prompt_kv = bool(clean_prompt_kv)
+
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """Generate `gen_length` tokens conditioned on `input_ids`.
@@ -125,12 +132,29 @@ class T3DecodeEngine:
         x[:, :seq_len] = input_ids
         position_ids = torch.arange(0, max_len, device=device).unsqueeze(0)
 
-        past_key_values = None
-        # First think input: prompt + first mask block.
-        x0 = x[:, : seq_len + self.block_size]
-        p0 = position_ids[:, : seq_len + self.block_size]
-
         nfe = 0
+        if self.clean_prompt_kv:
+            # Pass 0a: prompt-only prefill. Writes clean prompt K/V into the
+            # cache before any mask block is visible. The first per-block
+            # forward then consumes mask₀ alone with this clean cache, so
+            # prompt's K/V never sees mask₀.
+            prompt_outputs = self.model(
+                input_ids=x[:, :seq_len],
+                position_ids=position_ids[:, :seq_len],
+                use_cache=True,
+                past_key_values=None,
+                output_hidden_states=False,
+                prefer_no_mask=True,
+            )
+            past_key_values = prompt_outputs.past_key_values
+            nfe += 1
+            x0 = x[:, seq_len : seq_len + self.block_size]
+            p0 = position_ids[:, seq_len : seq_len + self.block_size]
+        else:
+            past_key_values = None
+            x0 = x[:, : seq_len + self.block_size]
+            p0 = position_ids[:, : seq_len + self.block_size]
+
         for block_idx in range(self.num_blocks):
             think_outputs = self.model(
                 input_ids=x0,
