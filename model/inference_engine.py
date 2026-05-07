@@ -182,6 +182,16 @@ class T3DecodeEngine:
         (final input_ids, nfe). Early-exits when the loss mask is all-zero."""
         loss_mask = torch.ones_like(talk_input_ids, dtype=torch.float32)
         talk_attn_mask = torch.ones_like(talk_input_ids, dtype=torch.long)
+        # Explicit zeros — matches HEAD~2's inline t3_generate. Passing None
+        # here forces LLaDAModel.forward into a code path that allocates a
+        # bidirectional bias internally; mathematically equivalent, but the
+        # different allocation pattern can change cuDNN kernel selection and
+        # flip argmax tie-breaks (~0.6pp drift on full GSM8K).
+        talk_attn_bias = torch.zeros(
+            (1, 1, self.block_size, self.block_size),
+            device=talk_input_ids.device,
+            dtype=torch.float32,
+        )
         talk_input_embeds = F.embedding(talk_input_ids, self.model.talk_embed_weight)
 
         nfe = 0
@@ -193,6 +203,7 @@ class T3DecodeEngine:
                 inputs_embeds=talk_input_embeds,
                 inputs_repres=talk_rps,
                 attention_mask=talk_attn_mask,
+                attention_bias=talk_attn_bias,
                 use_cache=False,
                 output_hidden_states=True,
             )
@@ -212,6 +223,7 @@ class T3DecodeEngine:
                     soft_temp=self.soft_temp,
                     mode=self.reveal_cfg.get("policy", "ar_force"),
                     decode_cfg=self.decode_cfg,
+                    sample_tokens=False,  # explicit; default already False, paranoia parity with HEAD~2
                 )
             else:
                 talk_input_ids, loss_mask, _, _ = denoise_k_step_hard(
